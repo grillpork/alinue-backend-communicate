@@ -12,6 +12,16 @@ const app = new Hono();
 // Logger
 app.use('*', logger());
 
+// Normalize double slashes in URL path (e.g. //api/posts -> /api/posts)
+app.use('*', async (c, next) => {
+  const url = new URL(c.req.url);
+  if (url.pathname.includes('//')) {
+    url.pathname = url.pathname.replace(/\/+/g, '/');
+    return c.redirect(url.toString(), 308);
+  }
+  await next();
+});
+
 // CORS Configuration
 app.use('*', async (c, next) => {
   const allowedOrigins = (
