@@ -27,7 +27,7 @@ function getGoogleConfig(c) {
   let clientUrl =
     c?.env?.CLIENT_URL ||
     process.env.CLIENT_URL ||
-    'http://localhost:3000';
+    'https://catako.site';
 
   let backendUrl = c?.env?.BACKEND_URL || process.env.BACKEND_URL;
   if (!backendUrl && c?.req) {
@@ -318,6 +318,18 @@ auth.post("/sign-out", async (c) => {
  */
 auth.get("/google", (c) => {
   const { clientId, redirectUri } = getGoogleConfig(c);
+
+  if (!clientId) {
+    return c.json(
+      {
+        success: false,
+        message:
+          "GOOGLE_CLIENT_ID is not configured in environment variables",
+      },
+      500
+    );
+  }
+
   const rootUrl = "https://accounts.google.com/o/oauth2/v2/auth";
 
   const params = new URLSearchParams({
