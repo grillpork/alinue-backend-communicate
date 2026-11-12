@@ -8,28 +8,20 @@ import { checkImageUrl, checkImageFile } from '../../utils/moderation';
 
 const upload = new Hono();
 
-// ประเภทไฟล์ที่อนุญาต
+// ประเภทไฟล์ที่อนุญาต (อนุญาตเฉพาะรูปภาพนิ่งเท่านั้น ไม่อนุญาต GIF หรือวิดีโอ)
 const ALLOWED_MIME_TYPES = {
-  // รูปภาพ (แปลงเป็น .webp เพื่อความเร็วและขนาดไฟล์ที่เล็กที่สุด)
   'image/webp': 'webp',
   'image/jpeg': 'jpg',
   'image/jpg': 'jpg',
   'image/png': 'png',
-  'image/gif': 'gif',
   'image/avif': 'avif',
-  'image/svg+xml': 'svg',
-  // วิดีโอ (รองรับ .webm และ .mp4)
-  'video/webm': 'webm',
-  'video/mp4': 'mp4',
-  'video/quicktime': 'mov',
 };
 
 /**
  * 1. POST /api/upload/presigned-url
  * ออกใบผ่านทางชั่วคราว (Presigned URL) ให้ Frontend อัปโหลดไฟล์ตรงเข้า Cloudflare R2
- * - รวดเร็วระดับ Edge ทั่วโลก
- * - รองรับ .webp, .webm, gif, video
- * - ไม่ติด timeout ของ Cloudflare Worker
+ * - รองรับเฉพาะไฟล์รูปภาพนิ่งเท่านั้น (.webp, .jpg, .png, .avif)
+ * - ปฏิเสธไฟล์ GIF, วิดีโอ หรือไฟล์ประเภทอื่นอย่างเด็ดขาด
  */
 upload.post('/presigned-url', optionalAuth, async (c) => {
   try {
@@ -49,27 +41,35 @@ upload.post('/presigned-url', optionalAuth, async (c) => {
     }
 
     const mime = contentType.toLowerCase();
-    if (!ALLOWED_MIME_TYPES[mime]) {
+
+    // ตรวจสอบปฏิเสธ GIF หรือวิดีโอทันที
+    if (mime === 'image/gif' || mime.startsWith('video/')) {
       return c.json(
         {
           success: false,
-          message: `Unsupported file type: ${mime}. Allowed: WebP, JPEG, PNG, GIF, WebM, MP4.`,
+          message:
+            'ไม่อนุญาตให้อัปโหลดไฟล์ GIF หรือวิดีโอ (ระบบรองรับเฉพาะไฟล์รูปภาพนิ่ง JPG, PNG, WebP, AVIF เท่านั้น)',
         },
         400
       );
     }
 
-    // กำหนด extension ปลายทาง
-    let ext = ALLOWED_MIME_TYPES[mime];
-    let finalContentType = mime;
+    if (!ALLOWED_MIME_TYPES[mime]) {
+      return c.json(
+        {
+          success: false,
+          message: `ไม่อนุญาตให้อัปโหลดไฟล์ประเภท ${mime} (ระบบรองรับเฉพาะไฟล์รูปภาพนิ่ง JPG, PNG, WebP, AVIF เท่านั้น)`,
+        },
+        400
+      );
+    }
 
-    // หากเป็นรูปภาพและ frontend เตรียมแปลงเป็น .webp หรือระบุเป็น webp
-    if (mime.startsWith('image/') && mime !== 'image/gif' && convertToWebp) {
-      ext = 'webp';
-      finalContentType = 'image/webp';
-    } else if (mime.startsWith('video/') && ext === 'webm') {
-      ext = 'webm';
-      finalContentType = 'video/webm';
+    // กำหนด extension ปลายทาง (แปลงเป็น webp เพื่อประสิทธิภาพสูงสุด)
+    let ext = 'webp';
+    let finalContentType = 'image/webp';
+    if (!convertToWebp) {
+      ext = ALLOWED_MIME_TYPES[mime] || 'webp';
+      finalContentType = mime;
     }
 
     // สร้าง Path และ Key ที่ไม่ซ้ำกัน
@@ -189,22 +189,32 @@ upload.post('/complete', optionalAuth, async (c) => {
       );
     }
 
-    const type = mimeType?.startsWith('video/') ? 'video' : 'image';
+    const mime = (mimeType || '').toLowerCase();
+    if (mime === 'image/gif' || mime.startsWith('video/') || !ALLOWED_MIME_TYPES[mime]) {
+      return c.json(
+        {
+          success: false,
+          message:
+            'ไม่อนุญาตให้อัปโหลดไฟล์ประเภทนี้ (ระบบรองรับเฉพาะรูปภาพนิ่ง JPG, PNG, WebP, AVIF เท่านั้น ไม่อนุญาต GIF หรือวิดีโอ)',
+        },
+        400
+      );
+    }
 
-    // ตรวจสอบความปลอดภัยของภาพ หากเป็นรูปภาพ
-    if (type === 'image') {
-      const moderation = await checkImageUrl(url, c.env);
-      if (!moderation.isSafe) {
-        return c.json(
-          {
-            success: false,
-            message: `รูปภาพไม่ผ่านการตรวจสอบความปลอดภัย: ${moderation.reasons.join(', ')}`,
-            reasons: moderation.reasons,
-            scores: moderation.scores,
-          },
-          400
-        );
-      }
+    const type = 'image';
+
+    // ตรวจสอบความปลอดภัยของภาพผ่าน Sightengine
+    const moderation = await checkImageUrl(url, c.env);
+    if (!moderation.isSafe) {
+      return c.json(
+        {
+          success: false,
+          message: `รูปภาพไม่ผ่านการตรวจสอบความปลอดภัย: ${moderation.reasons.join(', ')}`,
+          reasons: moderation.reasons,
+          scores: moderation.scores,
+        },
+        400
+      );
     }
 
     const sql = getDb(c);
@@ -268,20 +278,30 @@ upload.post('/direct', requireAuth, async (c) => {
       return c.json({ success: false, message: 'No file provided' }, 400);
     }
 
-    // ตรวจสอบความปลอดภัยของภาพ หากเป็นรูปภาพ
-    if (file.type?.startsWith('image/')) {
-      const moderation = await checkImageFile(file, c.env);
-      if (!moderation.isSafe) {
-        return c.json(
-          {
-            success: false,
-            message: `รูปภาพไม่ผ่านการตรวจสอบความปลอดภัย: ${moderation.reasons.join(', ')}`,
-            reasons: moderation.reasons,
-            scores: moderation.scores,
-          },
-          400
-        );
-      }
+    const mime = (file.type || '').toLowerCase();
+    if (mime === 'image/gif' || mime.startsWith('video/') || !ALLOWED_MIME_TYPES[mime]) {
+      return c.json(
+        {
+          success: false,
+          message:
+            'ไม่อนุญาตให้อัปโหลดไฟล์ประเภทนี้ (ระบบรองรับเฉพาะรูปภาพนิ่ง JPG, PNG, WebP, AVIF เท่านั้น ไม่อนุญาต GIF หรือวิดีโอ)',
+        },
+        400
+      );
+    }
+
+    // ตรวจสอบความปลอดภัยของภาพผ่าน Sightengine
+    const moderation = await checkImageFile(file, c.env);
+    if (!moderation.isSafe) {
+      return c.json(
+        {
+          success: false,
+          message: `รูปภาพไม่ผ่านการตรวจสอบความปลอดภัย: ${moderation.reasons.join(', ')}`,
+          reasons: moderation.reasons,
+          scores: moderation.scores,
+        },
+        400
+      );
     }
 
     const s3 = getR2Client(c);

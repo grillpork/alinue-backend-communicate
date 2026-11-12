@@ -205,34 +205,50 @@ showcaseRouter.post('/', requireAuth, async (c) => {
 
     if (finalMediaUrls.length === 0) {
       return c.json(
-        { success: false, message: 'At least one media URL (image/video) is required' },
+        { success: false, message: 'กรุณาอัปโหลดรูปภาพผลงานอย่างน้อย 1 รูป' },
         400
       );
     }
 
-    // ตรวจสอบความปลอดภัยของภาพผ่าน Sightengine (อนาจาร, อาวุธ, ความรุนแรง/เลือด)
+    // ตรวจสอบว่าต้องไม่ใช่ GIF หรือ Video
     for (const imgUrl of finalMediaUrls) {
-      if (typeof imgUrl === 'string' && imgUrl.startsWith('http') && !imgUrl.includes('.mp4') && !imgUrl.includes('.webm')) {
-        const check = await checkImageUrl(imgUrl, c.env);
-        if (!check.isSafe) {
+      if (typeof imgUrl === 'string') {
+        const lower = imgUrl.toLowerCase();
+        if (
+          lower.includes('.gif') ||
+          lower.includes('.mp4') ||
+          lower.includes('.webm') ||
+          lower.includes('.mov')
+        ) {
           return c.json(
             {
               success: false,
-              message: `ไม่สามารถบันทึกผลงานได้เนื่องจากรูปภาพไม่เหมาะสม: ${check.reasons.join(', ')}`,
-              reasons: check.reasons,
-              scores: check.scores,
+              message:
+                'ระบบรองรับเฉพาะรูปภาพนิ่ง (JPG, PNG, WebP) เท่านั้น ไม่อนุญาต GIF หรือวิดีโอ',
             },
             400
           );
         }
+
+        // ตรวจสอบความปลอดภัยของภาพผ่าน Sightengine (อนาจาร, อาวุธ, ความรุนแรง/เลือด)
+        if (lower.startsWith('http')) {
+          const check = await checkImageUrl(imgUrl, c.env);
+          if (!check.isSafe) {
+            return c.json(
+              {
+                success: false,
+                message: `ไม่สามารถบันทึกผลงานได้เนื่องจากรูปภาพไม่เหมาะสม: ${check.reasons.join(', ')}`,
+                reasons: check.reasons,
+                scores: check.scores,
+              },
+              400
+            );
+          }
+        }
       }
     }
 
-    const finalMediaType =
-      mediaType ||
-      (finalMediaUrls.some((u) => typeof u === 'string' && (u.includes('.webm') || u.includes('.mp4') || u.includes('.mov')))
-        ? 'video'
-        : 'image');
+    const finalMediaType = 'image';
     const finalCoverUrl = coverUrl || finalMediaUrls[0] || null;
     const finalTags = Array.isArray(rawTags) ? rawTags : [];
 

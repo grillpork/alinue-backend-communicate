@@ -184,3 +184,4 @@ export async function checkImageFile(fileOrBlob, env = {}) {
     return { isSafe: true, skipped: true, reasons: [] };
   }
 }
+

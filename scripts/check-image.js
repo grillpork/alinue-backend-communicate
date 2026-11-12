@@ -126,3 +126,4 @@ const targetImage = process.argv[2] || './images/test-3.jpg';
 if (process.argv[1]?.endsWith('check-image.js')) {
   checkImage(targetImage);
 }
+

@@ -167,9 +167,25 @@ postRouter.post('/', requireAuth, async (c) => {
       );
     }
 
-    // ตรวจสอบความเหมาะสมของรูปภาพผ่าน Sightengine (อนาจาร, อาวุธ, ความรุนแรง/เลือด)
+    // ตรวจสอบว่าต้องไม่ใช่ GIF หรือ Video และผ่าน Sightengine (อนาจาร, อาวุธ, ความรุนแรง/เลือด)
     for (const imgUrl of imagesList) {
-      const urlStr = typeof imgUrl === 'string' ? imgUrl : imgUrl?.url;
+      const urlStr = (typeof imgUrl === 'string' ? imgUrl : imgUrl?.url || '').toLowerCase();
+      if (
+        urlStr.includes('.gif') ||
+        urlStr.includes('.mp4') ||
+        urlStr.includes('.webm') ||
+        urlStr.includes('.mov')
+      ) {
+        return c.json(
+          {
+            success: false,
+            message:
+              'ระบบรองรับเฉพาะรูปภาพนิ่ง (JPG, PNG, WebP) เท่านั้น ไม่อนุญาต GIF หรือวิดีโอ',
+          },
+          400
+        );
+      }
+
       if (urlStr && urlStr.startsWith('http')) {
         const check = await checkImageUrl(urlStr, c.env);
         if (!check.isSafe) {
