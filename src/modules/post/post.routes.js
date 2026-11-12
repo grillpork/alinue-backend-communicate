@@ -363,6 +363,7 @@ postRouter.delete('/:id', requireAuth, async (c) => {
     // ลบความชอบและความคิดเห็นที่เกี่ยวข้อง
     await sql`DELETE FROM post_likes WHERE post_id = ${postId}`;
     await sql`DELETE FROM post_comments WHERE post_id = ${postId}`;
+    await sql`DELETE FROM post_shares WHERE post_id = ${postId}`.catch(() => {});
     await sql`DELETE FROM posts WHERE id = ${postId}`;
 
     return c.json({ success: true, message: 'Post deleted successfully' });
@@ -429,6 +430,71 @@ postRouter.post('/:id/like', requireAuth, async (c) => {
   } catch (err) {
     console.error('Toggle like error:', err);
     return c.json({ success: false, message: 'Failed to update like' }, 500);
+  }
+});
+
+/**
+ * 6. POST /api/posts/:id/share - แชร์โพสต์และบันทึกสถิติจำนวนแชร์ (shares_count)
+ */
+postRouter.post('/:id/share', optionalAuth, async (c) => {
+  try {
+    const postId = parseInt(c.req.param('id'), 10);
+    const user = c.get('user');
+    const sql = getDb(c);
+    const body = await c.req.json().catch(() => ({}));
+    const platform = body.platform || 'link';
+
+    if (isNaN(postId)) {
+      return c.json({ success: false, message: 'Invalid post ID' }, 400);
+    }
+
+    // 1. สร้างตาราง post_shares ถ้ายังไม่มี (สำหรับเก็บ Log การแชร์)
+    try {
+      await sql`
+        CREATE TABLE IF NOT EXISTS post_shares (
+          id SERIAL PRIMARY KEY,
+          post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+          user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+          platform VARCHAR(50) DEFAULT 'link',
+          "createdAt" TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        )
+      `;
+    } catch (tblErr) {
+      // ignore
+    }
+
+    // 2. บันทึก log การแชร์
+    try {
+      await sql`
+        INSERT INTO post_shares (post_id, user_id, platform, "createdAt")
+        VALUES (${postId}, ${user?.id || null}, ${platform}, NOW())
+      `;
+    } catch (insertErr) {
+      console.warn('Insert post_shares warning:', insertErr.message);
+    }
+
+    // 3. เพิ่มจำนวน shares_count ในตาราง posts
+    const updated = await sql`
+      UPDATE posts 
+      SET shares_count = COALESCE(shares_count, 0) + 1, "updatedAt" = NOW() 
+      WHERE id = ${postId}
+      RETURNING shares_count
+    `;
+
+    if (updated.length === 0) {
+      return c.json({ success: false, message: 'Post not found' }, 404);
+    }
+
+    const sharesCount = updated[0]?.shares_count ?? 0;
+
+    return c.json({
+      success: true,
+      message: 'Post shared successfully',
+      sharesCount,
+    });
+  } catch (err) {
+    console.error('Share post error:', err);
+    return c.json({ success: false, message: 'Failed to record share' }, 500);
   }
 });
 
