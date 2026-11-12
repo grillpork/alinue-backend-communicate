@@ -4,7 +4,14 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { getR2Client, getR2Config } from '../../config/r2';
 import { getDb } from '../../config/db';
 import { optionalAuth, requireAuth } from '../../middleware/auth';
-import { checkImageUrl, checkImageFile } from '../../utils/moderation';
+import {
+  checkImageUrl,
+  checkImageFile,
+  deleteFromR2,
+  checkUserTimeoutStatus,
+  recordModerationViolation,
+  getClientIp,
+} from '../../utils/moderation';
 
 const upload = new Hono();
 
@@ -25,6 +32,27 @@ const ALLOWED_MIME_TYPES = {
  */
 upload.post('/presigned-url', optionalAuth, async (c) => {
   try {
+    const sql = getDb(c);
+    const user = c.get('user');
+    const ipAddress = getClientIp(c);
+
+    // ตรวจสอบสถานะ Timeout / Rate Limit ของผู้ใช้ (Tier 3)
+    const timeoutStatus = await checkUserTimeoutStatus(sql, {
+      userId: user?.id,
+      ipAddress,
+    });
+    if (timeoutStatus.isTimedOut) {
+      return c.json(
+        {
+          success: false,
+          isTimedOut: true,
+          remainingMinutes: timeoutStatus.remainingMinutes,
+          message: timeoutStatus.message,
+        },
+        429
+      );
+    }
+
     const body = await c.req.json();
     const {
       filename,
@@ -201,11 +229,46 @@ upload.post('/complete', optionalAuth, async (c) => {
       );
     }
 
+    const sql = getDb(c);
+    const ipAddress = getClientIp(c);
     const type = 'image';
 
     // ตรวจสอบความปลอดภัยของภาพผ่าน Sightengine
     const moderation = await checkImageUrl(url, c.env);
     if (!moderation.isSafe) {
+      // 1. Tier 2: สั่งลบรูปภาพอันตรายออกจาก Cloudflare R2 ทันที
+      await deleteFromR2(c, fileKey || url);
+
+      // 2. Tier 3: บันทึก Audit Log ลงตาราง moderation_logs
+      await recordModerationViolation(sql, {
+        userId: user?.id,
+        ipAddress,
+        fileKey,
+        imageUrl: url,
+        reasons: moderation.reasons,
+        scores: moderation.scores,
+        actionTaken: 'rejected_and_deleted',
+      });
+
+      // 3. ตรวจสอบว่าติดฟิลเตอร์เกิน 3 ครั้งใน 10 นาที จนต้องระงับชั่วคราวหรือไม่
+      const updatedTimeout = await checkUserTimeoutStatus(sql, {
+        userId: user?.id,
+        ipAddress,
+      });
+
+      if (updatedTimeout.isTimedOut) {
+        return c.json(
+          {
+            success: false,
+            isTimedOut: true,
+            remainingMinutes: updatedTimeout.remainingMinutes,
+            message: updatedTimeout.message,
+            reasons: moderation.reasons,
+          },
+          429
+        );
+      }
+
       return c.json(
         {
           success: false,
@@ -216,8 +279,6 @@ upload.post('/complete', optionalAuth, async (c) => {
         400
       );
     }
-
-    const sql = getDb(c);
 
     const inserted = await sql`
       INSERT INTO media (
@@ -270,6 +331,26 @@ upload.post('/complete', optionalAuth, async (c) => {
 upload.post('/direct', requireAuth, async (c) => {
   try {
     const user = c.get('user');
+    const sql = getDb(c);
+    const ipAddress = getClientIp(c);
+
+    // ตรวจสอบสถานะ Timeout / Rate Limit ก่อน (Tier 3)
+    const timeoutStatus = await checkUserTimeoutStatus(sql, {
+      userId: user.id,
+      ipAddress,
+    });
+    if (timeoutStatus.isTimedOut) {
+      return c.json(
+        {
+          success: false,
+          isTimedOut: true,
+          remainingMinutes: timeoutStatus.remainingMinutes,
+          message: timeoutStatus.message,
+        },
+        429
+      );
+    }
+
     const body = await c.req.parseBody();
     const file = body['file'];
     const folder = body['folder'] || 'posts';
@@ -293,6 +374,35 @@ upload.post('/direct', requireAuth, async (c) => {
     // ตรวจสอบความปลอดภัยของภาพผ่าน Sightengine
     const moderation = await checkImageFile(file, c.env);
     if (!moderation.isSafe) {
+      // บันทึก Audit Log
+      await recordModerationViolation(sql, {
+        userId: user.id,
+        ipAddress,
+        fileKey: null,
+        imageUrl: null,
+        reasons: moderation.reasons,
+        scores: moderation.scores,
+        actionTaken: 'rejected',
+      });
+
+      const updatedTimeout = await checkUserTimeoutStatus(sql, {
+        userId: user.id,
+        ipAddress,
+      });
+
+      if (updatedTimeout.isTimedOut) {
+        return c.json(
+          {
+            success: false,
+            isTimedOut: true,
+            remainingMinutes: updatedTimeout.remainingMinutes,
+            message: updatedTimeout.message,
+            reasons: moderation.reasons,
+          },
+          429
+        );
+      }
+
       return c.json(
         {
           success: false,
@@ -327,7 +437,6 @@ upload.post('/direct', requireAuth, async (c) => {
     const fullPublicUrl = `${publicUrl}/${fileKey}`;
     const type = file.type.startsWith('video/') ? 'video' : 'image';
 
-    const sql = getDb(c);
     const inserted = await sql`
       INSERT INTO media (
         "fileKey",
@@ -361,6 +470,38 @@ upload.post('/direct', requireAuth, async (c) => {
     console.error('Direct upload error:', err);
     return c.json(
       { success: false, message: err.message || 'Direct upload failed' },
+      500
+    );
+  }
+});
+
+/**
+ * 5. GET /api/upload/moderation-status
+ * Tier 4: Admin Oversight - ตรวจสอบสถานะ Timeout / Rate Limit ของผู้ใช้ปัจจุบัน
+ * ใช้ให้ Frontend เช็คก่อนแสดงฟอร์มอัปโหลด หรือแสดง Cooldown UI
+ */
+upload.get('/moderation-status', optionalAuth, async (c) => {
+  try {
+    const sql = getDb(c);
+    const user = c.get('user');
+    const ipAddress = getClientIp(c);
+
+    const status = await checkUserTimeoutStatus(sql, {
+      userId: user?.id,
+      ipAddress,
+    });
+
+    return c.json({
+      success: true,
+      isTimedOut: status.isTimedOut,
+      remainingMinutes: status.remainingMinutes,
+      violationCount: status.violationCount,
+      message: status.message || null,
+    });
+  } catch (err) {
+    console.error('Moderation status error:', err);
+    return c.json(
+      { success: false, message: err.message || 'Failed to check moderation status' },
       500
     );
   }

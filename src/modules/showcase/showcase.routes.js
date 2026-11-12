@@ -1,7 +1,13 @@
 import { Hono } from 'hono';
 import { getDb } from '../../config/db';
 import { requireAuth, optionalAuth } from '../../middleware/auth';
-import { checkImageUrl } from '../../utils/moderation';
+import {
+  checkImageUrl,
+  deleteFromR2,
+  checkUserTimeoutStatus,
+  recordModerationViolation,
+  getClientIp,
+} from '../../utils/moderation';
 
 const showcaseRouter = new Hono();
 
@@ -180,6 +186,26 @@ showcaseRouter.post('/', requireAuth, async (c) => {
   try {
     const user = c.get('user');
     const body = await c.req.json();
+    const sql = getDb(c);
+    const ipAddress = getClientIp(c);
+
+    // Tier 3: ตรวจสอบสถานะ Timeout / Rate Limit ก่อนสร้าง Showcase
+    const timeoutStatus = await checkUserTimeoutStatus(sql, {
+      userId: user.id,
+      ipAddress,
+    });
+    if (timeoutStatus.isTimedOut) {
+      return c.json(
+        {
+          success: false,
+          isTimedOut: true,
+          remainingMinutes: timeoutStatus.remainingMinutes,
+          message: timeoutStatus.message,
+        },
+        429
+      );
+    }
+
     const title = body.title?.trim();
     const description = body.description?.trim() || null;
     
@@ -234,6 +260,39 @@ showcaseRouter.post('/', requireAuth, async (c) => {
         if (lower.startsWith('http')) {
           const check = await checkImageUrl(imgUrl, c.env);
           if (!check.isSafe) {
+            // Tier 2: ลบภาพอันตรายออกจาก R2 ทันที
+            await deleteFromR2(c, imgUrl);
+
+            // Tier 3: บันทึก Audit Log
+            await recordModerationViolation(sql, {
+              userId: user.id,
+              ipAddress,
+              fileKey: null,
+              imageUrl: imgUrl,
+              reasons: check.reasons,
+              scores: check.scores,
+              actionTaken: 'rejected_and_deleted',
+            });
+
+            // Tier 3: ตรวจสอบว่าติดฟิลเตอร์เกิน 3 ครั้งใน 10 นาทีหรือยัง
+            const updatedTimeout = await checkUserTimeoutStatus(sql, {
+              userId: user.id,
+              ipAddress,
+            });
+
+            if (updatedTimeout.isTimedOut) {
+              return c.json(
+                {
+                  success: false,
+                  isTimedOut: true,
+                  remainingMinutes: updatedTimeout.remainingMinutes,
+                  message: updatedTimeout.message,
+                  reasons: check.reasons,
+                },
+                429
+              );
+            }
+
             return c.json(
               {
                 success: false,
@@ -252,7 +311,6 @@ showcaseRouter.post('/', requireAuth, async (c) => {
     const finalCoverUrl = coverUrl || finalMediaUrls[0] || null;
     const finalTags = Array.isArray(rawTags) ? rawTags : [];
 
-    const sql = getDb(c);
     const inserted = await sql`
       INSERT INTO showcases (
         user_id,

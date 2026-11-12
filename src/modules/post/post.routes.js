@@ -1,7 +1,13 @@
 import { Hono } from 'hono';
 import { getDb } from '../../config/db';
 import { optionalAuth, requireAuth } from '../../middleware/auth';
-import { checkImageUrl } from '../../utils/moderation';
+import {
+  checkImageUrl,
+  deleteFromR2,
+  checkUserTimeoutStatus,
+  recordModerationViolation,
+  getClientIp,
+} from '../../utils/moderation';
 
 const postRouter = new Hono();
 
@@ -151,6 +157,25 @@ postRouter.post('/', requireAuth, async (c) => {
   try {
     const user = c.get('user');
     const sql = getDb(c);
+    const ipAddress = getClientIp(c);
+
+    // Tier 3: ตรวจสอบสถานะ Timeout / Rate Limit ก่อนสร้างโพสต์
+    const timeoutStatus = await checkUserTimeoutStatus(sql, {
+      userId: user.id,
+      ipAddress,
+    });
+    if (timeoutStatus.isTimedOut) {
+      return c.json(
+        {
+          success: false,
+          isTimedOut: true,
+          remainingMinutes: timeoutStatus.remainingMinutes,
+          message: timeoutStatus.message,
+        },
+        429
+      );
+    }
+
     const body = await c.req.json();
 
     const textContent = (body.content || body.caption || '').trim();
@@ -189,6 +214,39 @@ postRouter.post('/', requireAuth, async (c) => {
       if (urlStr && urlStr.startsWith('http')) {
         const check = await checkImageUrl(urlStr, c.env);
         if (!check.isSafe) {
+          // Tier 2: ลบภาพอันตรายออกจาก R2 ทันที
+          await deleteFromR2(c, imgUrl);
+
+          // Tier 3: บันทึก Audit Log
+          await recordModerationViolation(sql, {
+            userId: user.id,
+            ipAddress,
+            fileKey: null,
+            imageUrl: urlStr,
+            reasons: check.reasons,
+            scores: check.scores,
+            actionTaken: 'rejected_and_deleted',
+          });
+
+          // Tier 3: ตรวจสอบว่าติดฟิลเตอร์เกิน 3 ครั้งใน 10 นาทีหรือยัง
+          const updatedTimeout = await checkUserTimeoutStatus(sql, {
+            userId: user.id,
+            ipAddress,
+          });
+
+          if (updatedTimeout.isTimedOut) {
+            return c.json(
+              {
+                success: false,
+                isTimedOut: true,
+                remainingMinutes: updatedTimeout.remainingMinutes,
+                message: updatedTimeout.message,
+                reasons: check.reasons,
+              },
+              429
+            );
+          }
+
           return c.json(
             {
               success: false,
