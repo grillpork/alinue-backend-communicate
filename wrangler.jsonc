@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "alinue-backend",
+  "name": "alinue-backend-communicate",
   "main": "src/index.js",
   "compatibility_date": "2024-09-23",
   "compatibility_flags": ["nodejs_compat"],

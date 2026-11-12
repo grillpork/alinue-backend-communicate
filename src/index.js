@@ -39,6 +39,16 @@ app.use('*', async (c, next) => {
   return corsMiddleware(c, next);
 });
 
+// URL Normalizer: หากมี double slash (//) ใน request path ให้ redirect เป็น single slash (/) ด้วย 308
+app.use('*', async (c, next) => {
+  const url = new URL(c.req.url);
+  if (url.pathname.includes('//')) {
+    url.pathname = url.pathname.replace(/\/+/g, '/');
+    return c.redirect(url.toString(), 308);
+  }
+  await next();
+});
+
 // Root / Health Check
 app.get('/', (c) => {
   return c.json({

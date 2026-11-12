@@ -16,7 +16,9 @@ const auth = new Hono();
 function getGoogleConfig(c) {
   const rawClientId =
     c?.env?.GOOGLE_CLIENT_ID ||
+    c?.env?.NEXT_PUBLIC_GOOGLE_CLIENT_ID ||
     process.env.GOOGLE_CLIENT_ID ||
+    process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID ||
     '';
 
   const rawClientSecret =
