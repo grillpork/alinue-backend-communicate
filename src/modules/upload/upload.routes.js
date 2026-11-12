@@ -10,6 +10,7 @@ import {
   deleteFromR2,
   checkUserTimeoutStatus,
   recordModerationViolation,
+  createModerationAppeal,
   getClientIp,
 } from '../../utils/moderation';
 
@@ -240,7 +241,7 @@ upload.post('/complete', optionalAuth, async (c) => {
       await deleteFromR2(c, fileKey || url);
 
       // 2. Tier 3: บันทึก Audit Log ลงตาราง moderation_logs
-      await recordModerationViolation(sql, {
+      const logRecord = await recordModerationViolation(sql, {
         userId: user?.id,
         ipAddress,
         fileKey,
@@ -261,6 +262,8 @@ upload.post('/complete', optionalAuth, async (c) => {
           {
             success: false,
             isTimedOut: true,
+            logId: logRecord?.id || null,
+            imageUrl: url,
             remainingMinutes: updatedTimeout.remainingMinutes,
             message: updatedTimeout.message,
             reasons: moderation.reasons,
@@ -272,6 +275,8 @@ upload.post('/complete', optionalAuth, async (c) => {
       return c.json(
         {
           success: false,
+          logId: logRecord?.id || null,
+          imageUrl: url,
           message: `รูปภาพไม่ผ่านการตรวจสอบความปลอดภัย: ${moderation.reasons.join(', ')}`,
           reasons: moderation.reasons,
           scores: moderation.scores,
@@ -502,6 +507,96 @@ upload.get('/moderation-status', optionalAuth, async (c) => {
     console.error('Moderation status error:', err);
     return c.json(
       { success: false, message: err.message || 'Failed to check moderation status' },
+      500
+    );
+  }
+});
+
+/**
+ * 6. POST /api/upload/appeal
+ * Tier 4: Appeal / Request Review - ส่งคำร้องขออุทธรณ์กรณีที่คิดว่าภาพเป็น False Positive
+ */
+upload.post('/appeal', optionalAuth, async (c) => {
+  try {
+    const user = c.get('user');
+    const sql = getDb(c);
+    const ipAddress = getClientIp(c);
+    const body = await c.req.json();
+    const { logId, imageUrl, fileKey, reasons, appealReason } = body;
+
+    if (!appealReason || !appealReason.trim()) {
+      return c.json(
+        { success: false, message: 'กรุณาระบุเหตุผลการอุทธรณ์ เช่น เป็นภาพวาดกายวิภาค หรือศิลปะ' },
+        400
+      );
+    }
+
+    if (!imageUrl && !logId) {
+      return c.json(
+        { success: false, message: 'จำเป็นต้องระบุ imageUrl หรือ logId' },
+        400
+      );
+    }
+
+    const appeal = await createModerationAppeal(sql, {
+      logId: logId ? parseInt(logId, 10) : null,
+      userId: user?.id || null,
+      ipAddress,
+      imageUrl,
+      fileKey,
+      reasons: Array.isArray(reasons) ? reasons : reasons ? [reasons] : [],
+      appealReason: appealReason.trim(),
+    });
+
+    return c.json(
+      {
+        success: true,
+        message: 'ส่งคำร้องอุทธรณ์เรียบร้อยแล้ว แอดมินจะดำเนินการตรวจสอบให้โดยเร็วที่สุด',
+        appeal,
+      },
+      201
+    );
+  } catch (err) {
+    console.error('Submit appeal error:', err);
+    return c.json(
+      { success: false, message: err.message || 'Failed to submit appeal' },
+      500
+    );
+  }
+});
+
+/**
+ * 7. GET /api/upload/my-appeals
+ * ดูรายการอุทธรณ์ของผู้ใช้ปัจจุบัน
+ */
+upload.get('/my-appeals', optionalAuth, async (c) => {
+  try {
+    const user = c.get('user');
+    const sql = getDb(c);
+    const ipAddress = getClientIp(c);
+
+    if (!user?.id && (!ipAddress || ipAddress === 'unknown')) {
+      return c.json({ success: true, appeals: [] });
+    }
+
+    const appeals = await sql`
+      SELECT *
+      FROM moderation_appeals
+      WHERE 
+        (${user?.id ? sql`user_id = ${user.id}` : sql`false`})
+        OR (${ipAddress && ipAddress !== 'unknown' ? sql`ip_address = ${ipAddress}` : sql`false`})
+      ORDER BY "createdAt" DESC
+      LIMIT 20
+    `;
+
+    return c.json({
+      success: true,
+      appeals,
+    });
+  } catch (err) {
+    console.error('Get my appeals error:', err);
+    return c.json(
+      { success: false, message: err.message || 'Failed to fetch appeals' },
       500
     );
   }

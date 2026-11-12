@@ -65,7 +65,7 @@ export async function deleteFromR2(c, fileKeyOrUrl) {
 }
 
 /**
- * ตรวจสอบและสร้างตาราง moderation_logs อัตโนมัติ (Tier 3 Audit Log)
+ * ตรวจสอบและสร้างตาราง moderation_logs และ moderation_appeals อัตโนมัติ (Tier 3 & 4)
  */
 let isTableInitialized = false;
 export async function ensureModerationLogsTable(sql) {
@@ -83,6 +83,25 @@ export async function ensureModerationLogsTable(sql) {
         is_safe BOOLEAN DEFAULT false,
         action_taken VARCHAR(50) DEFAULT 'rejected',
         "createdAt" TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      )
+    `;
+
+    await sql`
+      CREATE TABLE IF NOT EXISTS moderation_appeals (
+        id SERIAL PRIMARY KEY,
+        log_id INTEGER,
+        user_id INTEGER,
+        ip_address VARCHAR(100),
+        image_url TEXT,
+        file_key VARCHAR(255),
+        reasons JSONB,
+        appeal_reason TEXT NOT NULL,
+        status VARCHAR(30) DEFAULT 'pending',
+        reviewer_id INTEGER,
+        reviewer_note TEXT,
+        reviewed_at TIMESTAMP WITH TIME ZONE,
+        "createdAt" TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        "updatedAt" TIMESTAMP WITH TIME ZONE DEFAULT NOW()
       )
     `;
     isTableInitialized = true;
@@ -143,16 +162,17 @@ export async function checkUserTimeoutStatus(sql, { userId, ipAddress }) {
 
 /**
  * บันทึกประวัติการละเมิดลงตาราง moderation_logs (Tier 3 Logging)
+ * ส่งกลับ Object ของ Log ที่ถูกบันทึก รวมถึง id เพื่อนำไปใช้อุทธรณ์ได้
  */
 export async function recordModerationViolation(
   sql,
   { userId, ipAddress, fileKey, imageUrl, reasons, scores, actionTaken = 'rejected' }
 ) {
-  if (!sql) return;
+  if (!sql) return null;
   try {
     await ensureModerationLogsTable(sql);
 
-    await sql`
+    const inserted = await sql`
       INSERT INTO moderation_logs (
         user_id,
         ip_address,
@@ -174,14 +194,123 @@ export async function recordModerationViolation(
         ${actionTaken},
         NOW()
       )
+      RETURNING *
     `;
 
     console.log(
       `[Tier 3 Audit Log] บันทึกการตรวจพบภาพอันตราย (User: ${userId || 'Guest'}, IP: ${ipAddress}): ${reasons?.join(', ')}`
     );
+    return inserted[0] || null;
   } catch (err) {
     console.error('[recordModerationViolation error]:', err.message);
+    return null;
   }
+}
+
+/**
+ * สร้างคำร้องอุทธรณ์สำหรับภาพที่ติดฟิลเตอร์ (Tier 4 Appeal System)
+ */
+export async function createModerationAppeal(
+  sql,
+  { logId, userId, ipAddress, imageUrl, fileKey, reasons, appealReason }
+) {
+  if (!sql) throw new Error('Database connection unavailable');
+  await ensureModerationLogsTable(sql);
+
+  // หากมี logId ให้ดึงข้อมูล reasons และ imageUrl จาก log หากไม่ได้ส่งมา
+  let targetReasons = reasons || [];
+  let targetImageUrl = imageUrl || null;
+  let targetFileKey = fileKey || null;
+
+  if (logId) {
+    const logs = await sql`SELECT * FROM moderation_logs WHERE id = ${logId} LIMIT 1`;
+    if (logs.length > 0) {
+      const log = logs[0];
+      if (!targetImageUrl) targetImageUrl = log.image_url;
+      if (!targetFileKey) targetFileKey = log.file_key;
+      if (targetReasons.length === 0 && log.reasons) {
+        targetReasons = Array.isArray(log.reasons) ? log.reasons : [log.reasons];
+      }
+    }
+  }
+
+  const inserted = await sql`
+    INSERT INTO moderation_appeals (
+      log_id,
+      user_id,
+      ip_address,
+      image_url,
+      file_key,
+      reasons,
+      appeal_reason,
+      status,
+      "createdAt",
+      "updatedAt"
+    ) VALUES (
+      ${logId || null},
+      ${userId || null},
+      ${ipAddress || null},
+      ${targetImageUrl},
+      ${targetFileKey},
+      ${JSON.stringify(targetReasons)}::jsonb,
+      ${appealReason},
+      'pending',
+      NOW(),
+      NOW()
+    )
+    RETURNING *
+  `;
+
+  return inserted[0];
+}
+
+/**
+ * เจ้าหน้าที่/แอดมินพิจารณาคำอุทธรณ์ (Human Moderator Review)
+ */
+export async function reviewModerationAppeal(
+  sql,
+  { appealId, reviewerId, action, reviewerNote }
+) {
+  if (!sql) throw new Error('Database connection unavailable');
+  await ensureModerationLogsTable(sql);
+
+  const status = action === 'approve' ? 'approved' : 'rejected';
+
+  const updated = await sql`
+    UPDATE moderation_appeals
+    SET 
+      status = ${status},
+      reviewer_id = ${reviewerId || null},
+      reviewer_note = ${reviewerNote || null},
+      reviewed_at = NOW(),
+      "updatedAt" = NOW()
+    WHERE id = ${appealId}
+    RETURNING *
+  `;
+
+  if (updated.length === 0) {
+    throw new Error('ไม่พบรายการคำอุทธรณ์ที่ระบุ');
+  }
+
+  const appeal = updated[0];
+
+  // หาก Admin อนุมัติว่าภาพปลอดภัย (False Positive)
+  // ให้ปรับสถานะใน moderation_logs เป็น is_safe = true เพื่อยกเลิกโทษ/strike ของ user
+  if (status === 'approved' && appeal.log_id) {
+    try {
+      await sql`
+        UPDATE moderation_logs
+        SET 
+          is_safe = true,
+          action_taken = 'approved_on_appeal'
+        WHERE id = ${appeal.log_id}
+      `;
+    } catch (err) {
+      console.warn('[reviewModerationAppeal log update warning]:', err.message);
+    }
+  }
+
+  return appeal;
 }
 
 /**
