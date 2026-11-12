@@ -17,6 +17,8 @@ interface __BaseEnv_CloudflareBindings {
 	R2_PUBLIC_URL: string;
 	GOOGLE_CLIENT_ID: string;
 	GOOGLE_CLIENT_SECRET: string;
+	SIGHTENGINE_API_USER?: string;
+	SIGHTENGINE_API_SECRET?: string;
 }
 declare namespace Cloudflare {
 	interface GlobalProps {

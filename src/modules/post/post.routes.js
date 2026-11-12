@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { getDb } from '../../config/db';
 import { optionalAuth, requireAuth } from '../../middleware/auth';
+import { checkImageUrl } from '../../utils/moderation';
 
 const postRouter = new Hono();
 
@@ -164,6 +165,25 @@ postRouter.post('/', requireAuth, async (c) => {
         { success: false, message: 'Post must contain text content or images' },
         400
       );
+    }
+
+    // ตรวจสอบความเหมาะสมของรูปภาพผ่าน Sightengine (อนาจาร, อาวุธ, ความรุนแรง/เลือด)
+    for (const imgUrl of imagesList) {
+      const urlStr = typeof imgUrl === 'string' ? imgUrl : imgUrl?.url;
+      if (urlStr && urlStr.startsWith('http')) {
+        const check = await checkImageUrl(urlStr, c.env);
+        if (!check.isSafe) {
+          return c.json(
+            {
+              success: false,
+              message: `ไม่สามารถโพสต์ได้เนื่องจากรูปภาพไม่เหมาะสม: ${check.reasons.join(', ')}`,
+              reasons: check.reasons,
+              scores: check.scores,
+            },
+            400
+          );
+        }
+      }
     }
 
     // สกัด hashtags อัตโนมัติจากข้อความ ถ้าไม่ได้ส่ง tags มา

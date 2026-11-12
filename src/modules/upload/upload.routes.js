@@ -4,6 +4,7 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { getR2Client, getR2Config } from '../../config/r2';
 import { getDb } from '../../config/db';
 import { optionalAuth, requireAuth } from '../../middleware/auth';
+import { checkImageUrl, checkImageFile } from '../../utils/moderation';
 
 const upload = new Hono();
 
@@ -113,8 +114,57 @@ upload.post('/presigned-url', optionalAuth, async (c) => {
 });
 
 /**
- * 2. POST /api/upload/complete
- * บันทึกข้อมูลมีเดียลง Neon DB เมื่อ Frontend อัปโหลดไฟล์เข้า R2 เสร็จสิ้น
+ * 2. POST /api/upload/check
+ * ตรวจสอบความเหมาะสมของรูปภาพผ่าน Sightengine API (อนาจาร, อาวุธ, ความรุนแรง/เลือด)
+ * รองรับทั้งการส่ง { url: 'https://...' } หรือส่งไฟล์ผ่าน FormData ('file' หรือ 'media')
+ */
+upload.post('/check', optionalAuth, async (c) => {
+  try {
+    const contentType = c.req.header('content-type') || '';
+
+    // กรณีส่ง JSON พร้อม Image URL
+    if (contentType.includes('application/json')) {
+      const { url } = await c.req.json();
+      if (!url) {
+        return c.json({ success: false, message: 'Image url is required' }, 400);
+      }
+
+      const result = await checkImageUrl(url, c.env);
+      return c.json({
+        success: true,
+        ...result,
+      });
+    }
+
+    // กรณีส่งไฟล์ภาพตรงผ่าน multipart/form-data
+    if (contentType.includes('multipart/form-data')) {
+      const body = await c.req.parseBody();
+      const file = body['file'] || body['media'];
+
+      if (!file || !(file instanceof File)) {
+        return c.json({ success: false, message: 'Image file is required' }, 400);
+      }
+
+      const result = await checkImageFile(file, c.env);
+      return c.json({
+        success: true,
+        ...result,
+      });
+    }
+
+    return c.json({ success: false, message: 'Invalid Content-Type' }, 400);
+  } catch (err) {
+    console.error('Image moderation check error:', err);
+    return c.json(
+      { success: false, message: err.message || 'Image moderation failed' },
+      500
+    );
+  }
+});
+
+/**
+ * 3. POST /api/upload/complete
+ * ตรวจสอบความปลอดภัยของรูปภาพ และบันทึกข้อมูลมีเดียลง Neon DB เมื่อ Frontend อัปโหลดไฟล์เข้า R2 เสร็จสิ้น
  */
 upload.post('/complete', optionalAuth, async (c) => {
   try {
@@ -140,6 +190,23 @@ upload.post('/complete', optionalAuth, async (c) => {
     }
 
     const type = mimeType?.startsWith('video/') ? 'video' : 'image';
+
+    // ตรวจสอบความปลอดภัยของภาพ หากเป็นรูปภาพ
+    if (type === 'image') {
+      const moderation = await checkImageUrl(url, c.env);
+      if (!moderation.isSafe) {
+        return c.json(
+          {
+            success: false,
+            message: `รูปภาพไม่ผ่านการตรวจสอบความปลอดภัย: ${moderation.reasons.join(', ')}`,
+            reasons: moderation.reasons,
+            scores: moderation.scores,
+          },
+          400
+        );
+      }
+    }
+
     const sql = getDb(c);
 
     const inserted = await sql`
@@ -199,6 +266,22 @@ upload.post('/direct', requireAuth, async (c) => {
 
     if (!file || !(file instanceof File)) {
       return c.json({ success: false, message: 'No file provided' }, 400);
+    }
+
+    // ตรวจสอบความปลอดภัยของภาพ หากเป็นรูปภาพ
+    if (file.type?.startsWith('image/')) {
+      const moderation = await checkImageFile(file, c.env);
+      if (!moderation.isSafe) {
+        return c.json(
+          {
+            success: false,
+            message: `รูปภาพไม่ผ่านการตรวจสอบความปลอดภัย: ${moderation.reasons.join(', ')}`,
+            reasons: moderation.reasons,
+            scores: moderation.scores,
+          },
+          400
+        );
+      }
     }
 
     const s3 = getR2Client(c);

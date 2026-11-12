@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { getDb } from '../../config/db';
 import { requireAuth, optionalAuth } from '../../middleware/auth';
+import { checkImageUrl } from '../../utils/moderation';
 
 const showcaseRouter = new Hono();
 
@@ -207,6 +208,24 @@ showcaseRouter.post('/', requireAuth, async (c) => {
         { success: false, message: 'At least one media URL (image/video) is required' },
         400
       );
+    }
+
+    // ตรวจสอบความปลอดภัยของภาพผ่าน Sightengine (อนาจาร, อาวุธ, ความรุนแรง/เลือด)
+    for (const imgUrl of finalMediaUrls) {
+      if (typeof imgUrl === 'string' && imgUrl.startsWith('http') && !imgUrl.includes('.mp4') && !imgUrl.includes('.webm')) {
+        const check = await checkImageUrl(imgUrl, c.env);
+        if (!check.isSafe) {
+          return c.json(
+            {
+              success: false,
+              message: `ไม่สามารถบันทึกผลงานได้เนื่องจากรูปภาพไม่เหมาะสม: ${check.reasons.join(', ')}`,
+              reasons: check.reasons,
+              scores: check.scores,
+            },
+            400
+          );
+        }
+      }
     }
 
     const finalMediaType =
