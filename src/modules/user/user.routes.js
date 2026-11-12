@@ -54,7 +54,54 @@ userRouter.get('/suggested', optionalAuth, async (c) => {
 });
 
 /**
- * 2. GET /api/users/profile/:username - ดึงข้อมูลโปรไฟล์สาธารณะตาม Username
+ * 2. GET /api/users/search - ค้นหาครีเอเตอร์ / ดีไซเนอร์ตามชื่อหรือ Username
+ */
+userRouter.get('/search', optionalAuth, async (c) => {
+  try {
+    const q = (c.req.query('q') || '').trim();
+    if (!q) {
+      return c.json({ success: true, users: [] });
+    }
+    const sql = getDb(c);
+    const currentUser = c.get('user');
+
+    const users = await sql`
+      SELECT 
+        u.id,
+        u.username,
+        u."displayName",
+        u."avatarUrl",
+        u.bio,
+        ${
+          currentUser?.id
+            ? sql`EXISTS(SELECT 1 FROM follows f WHERE f.follower_id = ${currentUser.id} AND f.following_id = u.id) as is_following`
+            : sql`false as is_following`
+        }
+      FROM users u
+      WHERE u.username ILIKE ${'%' + q + '%'} 
+         OR u."displayName" ILIKE ${'%' + q + '%'}
+         OR u.bio ILIKE ${'%' + q + '%'}
+      LIMIT 8
+    `;
+
+    const formatted = users.map((u) => ({
+      id: u.id,
+      name: u.displayName || u.username,
+      username: u.username,
+      avatar: u.avatarUrl || '',
+      bio: u.bio || '',
+      isFollowing: Boolean(u.is_following),
+    }));
+
+    return c.json({ success: true, users: formatted });
+  } catch (err) {
+    console.error('Search users error:', err);
+    return c.json({ success: false, message: 'Server error' }, 500);
+  }
+});
+
+/**
+ * 3. GET /api/users/profile/:username - ดึงข้อมูลโปรไฟล์สาธารณะตาม Username
  */
 userRouter.get('/profile/:username', optionalAuth, async (c) => {
   try {
