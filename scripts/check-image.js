@@ -28,13 +28,12 @@ loadEnv();
 export async function checkImage(imagePathOrUrl) {
   const apiUser = process.env.SIGHTENGINE_API_USER;
   const apiSecret = process.env.SIGHTENGINE_API_SECRET;
+  const models = process.env.SIGHTENGINE_MODELS || process.env.sightengine_MODELS;
 
-  if (!apiUser || !apiSecret) {
-    console.error('❌ Error: กรุณากำหนด SIGHTENGINE_API_USER และ SIGHTENGINE_API_SECRET ใน .env ก่อน');
+  if (!apiUser || !apiSecret || !models) {
+    console.error('❌ Error: กรุณากำหนด SIGHTENGINE_API_USER, SIGHTENGINE_API_SECRET และ SIGHTENGINE_MODELS ใน .env ก่อน');
     return;
   }
-
-  const models = 'nudity-2.1,weapon,gore';
   console.log(`\n🔍 กำลังตรวจสอบภาพ: ${imagePathOrUrl}`);
   console.log(`📋 Models ที่ใช้: ${models}\n`);
 

@@ -10,7 +10,6 @@ import { getR2Client, getR2Config } from '../config/r2';
  */
 
 const SIGHTENGINE_API_URL = 'https://api.sightengine.com/1.0/check.json';
-const DEFAULT_MODELS = 'nudity-2.1,weapon,gore';
 const MAX_VIOLATIONS_BEFORE_TIMEOUT = 3; // ติดฟิลเตอร์ 3 ครั้ง
 const VIOLATION_WINDOW_MINUTES = 10; // ภายใน 10 นาที
 const TIMEOUT_DURATION_MINUTES = 15; // พักการใช้งาน 15 นาที
@@ -314,7 +313,7 @@ export async function reviewModerationAppeal(
 }
 
 /**
- * ดึง API User และ API Secret จาก env
+ * ดึง API User, API Secret และ Models จาก env เท่านั้น
  */
 function getSightengineCredentials(env = {}) {
   const apiUser =
@@ -325,10 +324,17 @@ function getSightengineCredentials(env = {}) {
     env?.SIGHTENGINE_API_SECRET ||
     process.env.SIGHTENGINE_API_SECRET ||
     '';
+  const models =
+    env?.SIGHTENGINE_MODELS ||
+    env?.sightengine_MODELS ||
+    process.env.SIGHTENGINE_MODELS ||
+    process.env.sightengine_MODELS ||
+    '';
 
   return {
     apiUser: String(apiUser).trim(),
     apiSecret: String(apiSecret).trim(),
+    models: String(models).trim(),
   };
 }
 
@@ -413,17 +419,17 @@ export function evaluateModerationResult(data) {
  */
 export async function checkImageUrl(imageUrl, env = {}) {
   try {
-    const { apiUser, apiSecret } = getSightengineCredentials(env);
+    const { apiUser, apiSecret, models } = getSightengineCredentials(env);
 
-    if (!apiUser || !apiSecret) {
+    if (!apiUser || !apiSecret || !models) {
       console.warn(
-        '[Sightengine] SIGHTENGINE_API_USER หรือ SIGHTENGINE_API_SECRET ยังไม่ได้ตั้งค่าใน .env, ข้ามการตรวจสอบชั่วคราว'
+        '[Sightengine] SIGHTENGINE_API_USER, SIGHTENGINE_API_SECRET หรือ SIGHTENGINE_MODELS ยังไม่ได้ตั้งค่าใน env, ข้ามการตรวจสอบชั่วคราว'
       );
       return { isSafe: true, skipped: true, reasons: [] };
     }
 
     const endpoint = new URL(SIGHTENGINE_API_URL);
-    endpoint.searchParams.set('models', DEFAULT_MODELS);
+    endpoint.searchParams.set('models', models);
     endpoint.searchParams.set('api_user', apiUser);
     endpoint.searchParams.set('api_secret', apiSecret);
     endpoint.searchParams.set('url', imageUrl);
@@ -455,18 +461,18 @@ export async function checkImageUrl(imageUrl, env = {}) {
  */
 export async function checkImageFile(fileOrBlob, env = {}) {
   try {
-    const { apiUser, apiSecret } = getSightengineCredentials(env);
+    const { apiUser, apiSecret, models } = getSightengineCredentials(env);
 
-    if (!apiUser || !apiSecret) {
+    if (!apiUser || !apiSecret || !models) {
       console.warn(
-        '[Sightengine] SIGHTENGINE_API_USER หรือ SIGHTENGINE_API_SECRET ยังไม่ได้ตั้งค่าใน .env, ข้ามการตรวจสอบชั่วคราว'
+        '[Sightengine] SIGHTENGINE_API_USER, SIGHTENGINE_API_SECRET หรือ SIGHTENGINE_MODELS ยังไม่ได้ตั้งค่าใน env, ข้ามการตรวจสอบชั่วคราว'
       );
       return { isSafe: true, skipped: true, reasons: [] };
     }
 
     const formData = new FormData();
     formData.append('media', fileOrBlob);
-    formData.append('models', DEFAULT_MODELS);
+    formData.append('models', models);
     formData.append('api_user', apiUser);
     formData.append('api_secret', apiSecret);
 
