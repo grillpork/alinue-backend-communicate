@@ -8,6 +8,7 @@ import {
   recordModerationViolation,
   getClientIp,
 } from '../../utils/moderation';
+import { createNotification } from '../notification/notification.service';
 
 const postRouter = new Hono();
 
@@ -508,6 +509,19 @@ postRouter.post('/:id/like', requireAuth, async (c) => {
         WHERE id = ${postId}
       `;
       isLiked = true;
+
+      // สร้างการแจ้งเตือน
+      const postOwnerRes = await sql`SELECT user_id, caption FROM posts WHERE id = ${postId} LIMIT 1`;
+      if (postOwnerRes.length > 0) {
+        await createNotification(sql, {
+          userId: postOwnerRes[0].user_id,
+          actorId: user.id,
+          type: 'like',
+          entityId: postId,
+          entityType: 'post',
+          message: postOwnerRes[0].caption ? postOwnerRes[0].caption.slice(0, 80) : null,
+        });
+      }
     }
 
     // ดึงจำนวนไลก์ล่าสุด
@@ -717,6 +731,19 @@ postRouter.post('/:id/comments', requireAuth, async (c) => {
       SET comments_count = comments_count + 1, "updatedAt" = NOW() 
       WHERE id = ${postId}
     `;
+
+    // สร้างการแจ้งเตือนสำหรับเจ้าของโพสต์
+    const postOwnerRes = await sql`SELECT user_id FROM posts WHERE id = ${postId} LIMIT 1`;
+    if (postOwnerRes.length > 0) {
+      await createNotification(sql, {
+        userId: postOwnerRes[0].user_id,
+        actorId: user.id,
+        type: 'comment',
+        entityId: postId,
+        entityType: 'post',
+        message: content.trim().slice(0, 100),
+      });
+    }
 
     // ดึงข้อมูล Author
     const authors = await sql`

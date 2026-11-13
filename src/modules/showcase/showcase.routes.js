@@ -8,6 +8,7 @@ import {
   recordModerationViolation,
   getClientIp,
 } from '../../utils/moderation';
+import { createNotification } from '../notification/notification.service';
 
 const showcaseRouter = new Hono();
 
@@ -418,6 +419,19 @@ showcaseRouter.post('/:id/like', requireAuth, async (c) => {
         WHERE id = ${showcaseId}
       `;
       isLiked = true;
+
+      // สร้างการแจ้งเตือน Like Showcase
+      const scOwnerRes = await sql`SELECT user_id, title FROM showcases WHERE id = ${showcaseId} LIMIT 1`;
+      if (scOwnerRes.length > 0) {
+        await createNotification(sql, {
+          userId: scOwnerRes[0].user_id,
+          actorId: user.id,
+          type: 'showcase_like',
+          entityId: showcaseId,
+          entityType: 'showcase',
+          message: scOwnerRes[0].title || null,
+        });
+      }
     }
 
     // ดึงจำนวน Like ล่าสุด

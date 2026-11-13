@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { getDb } from '../../config/db';
 import { optionalAuth, requireAuth } from '../../middleware/auth';
+import { createNotification } from '../notification/notification.service';
 
 const userRouter = new Hono();
 
@@ -323,6 +324,13 @@ userRouter.post('/:id/follow', requireAuth, async (c) => {
         VALUES (${user.id}, ${targetId}, NOW())
       `;
       isFollowing = true;
+
+      // สร้างการแจ้งเตือน Follow
+      await createNotification(sql, {
+        userId: targetId,
+        actorId: user.id,
+        type: 'follow',
+      });
     }
 
     const countRes = await sql`
