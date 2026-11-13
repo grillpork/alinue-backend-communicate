@@ -8,6 +8,7 @@ import upload from './modules/upload/upload.routes';
 import showcaseRouter from './modules/showcase/showcase.routes';
 import adminRouter from './modules/admin/admin.routes';
 import notificationRouter from './modules/notification/notification.routes';
+import storyRouter from './modules/story/story.routes';
 
 const app = new Hono();
 
@@ -75,6 +76,7 @@ app.route('/api/showcases', showcaseRouter);
 app.route('/api/admin', adminRouter);
 app.route('/admin', adminRouter);
 app.route('/api/notifications', notificationRouter);
+app.route('/api/stories', storyRouter);
 
 // 404 Handler
 app.notFound((c) => {
