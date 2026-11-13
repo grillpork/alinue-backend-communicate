@@ -10,6 +10,6 @@
     "R2_BUCKET_NAME": "cats-coworker",
     "R2_PUBLIC_URL": "https://pub-6d43351c06b34d6c91ecef3d7be6d4c3.r2.dev",
     "GOOGLE_CLIENT_ID": "47591419904-b8kk8sfnlp8pa30vc8kkikhcdeka16tc.apps.googleusercontent.com",
-    "SIGHTENGINE_MODELS": "nudity-2.1,weapon,gore"
+    "SIGHTENGINE_MODELS": "nudity-2.1"
   }
 }
