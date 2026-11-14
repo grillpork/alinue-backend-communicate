@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { getDrizzle, getDb } from '../../config/db.js';
-import { posts, postLikes, postComments, postShares, users, showcases, searchLogs } from '../../db/schema.js';
+import { posts, postLikes, postComments, postShares, users, showcases, services, searchLogs } from '../../db/schema.js';
 import { optionalAuth, requireAuth } from '../../middleware/auth.js';
 import {
   checkImageUrl,
@@ -57,6 +57,11 @@ postRouter.get('/', optionalAuth, async (c) => {
         commentsCount: posts.commentsCount,
         sharesCount: posts.sharesCount,
         viewsCount: posts.viewsCount,
+        serviceId: posts.serviceId,
+        serviceTitle: posts.serviceTitle,
+        serviceCoverUrl: services.coverUrl,
+        servicePrice: services.price,
+        servicePriceText: services.priceText,
         createdAt: posts.createdAt,
         updatedAt: posts.updatedAt,
         authorUsername: users.username,
@@ -72,6 +77,7 @@ postRouter.get('/', optionalAuth, async (c) => {
       })
       .from(posts)
       .leftJoin(users, eq(posts.userId, users.id))
+      .leftJoin(services, eq(posts.serviceId, services.id))
       .where(whereClause)
       .orderBy(desc(posts.createdAt))
       .limit(limit)
@@ -103,6 +109,16 @@ postRouter.get('/', optionalAuth, async (c) => {
         sharesCount: p.sharesCount || 0,
         viewsCount: p.viewsCount || 0,
         isLiked: Boolean(p.isLiked),
+        serviceId: p.serviceId || null,
+        service: p.serviceId
+          ? {
+              id: p.serviceId,
+              title: p.serviceTitle,
+              price: p.servicePrice,
+              priceText: p.servicePriceText,
+              coverUrl: p.serviceCoverUrl,
+            }
+          : null,
         createdAt: p.createdAt,
         updatedAt: p.updatedAt,
         author: {
@@ -272,6 +288,18 @@ postRouter.post('/', requireAuth, async (c) => {
       ? body.collaborators
       : [];
 
+    const serviceId = body.serviceId || body.service_id ? parseInt(body.serviceId || body.service_id, 10) : null;
+    let serviceTitle = body.serviceTitle || null;
+
+    if (serviceId && !serviceTitle) {
+      try {
+        const srv = await db.select({ title: services.title }).from(services).where(eq(services.id, serviceId)).limit(1);
+        if (srv.length > 0) {
+          serviceTitle = srv[0].title;
+        }
+      } catch {}
+    }
+
     const inserted = await db
       .insert(posts)
       .values({
@@ -280,6 +308,8 @@ postRouter.post('/', requireAuth, async (c) => {
         mediaUrls: imagesList,
         tags,
         collaborators,
+        serviceId: serviceId || null,
+        serviceTitle: serviceTitle || null,
         likesCount: 0,
         commentsCount: 0,
         sharesCount: 0,
@@ -315,6 +345,8 @@ postRouter.post('/', requireAuth, async (c) => {
       commentsCount: 0,
       sharesCount: 0,
       isLiked: false,
+      serviceId: serviceId || null,
+      serviceTitle: serviceTitle || null,
       createdAt: newPost.createdAt,
       updatedAt: newPost.updatedAt,
       author: {
@@ -368,6 +400,11 @@ postRouter.get('/:id', optionalAuth, async (c) => {
         commentsCount: posts.commentsCount,
         sharesCount: posts.sharesCount,
         viewsCount: posts.viewsCount,
+        serviceId: posts.serviceId,
+        serviceTitle: posts.serviceTitle,
+        serviceCoverUrl: services.coverUrl,
+        servicePrice: services.price,
+        servicePriceText: services.priceText,
         createdAt: posts.createdAt,
         updatedAt: posts.updatedAt,
         authorUsername: users.username,
@@ -383,6 +420,7 @@ postRouter.get('/:id', optionalAuth, async (c) => {
       })
       .from(posts)
       .leftJoin(users, eq(posts.userId, users.id))
+      .leftJoin(services, eq(posts.serviceId, services.id))
       .where(eq(posts.id, postId))
       .limit(1);
 
@@ -415,6 +453,16 @@ postRouter.get('/:id', optionalAuth, async (c) => {
         commentsCount: p.commentsCount || 0,
         sharesCount: p.sharesCount || 0,
         isLiked: Boolean(p.isLiked),
+        serviceId: p.serviceId || null,
+        service: p.serviceId
+          ? {
+              id: p.serviceId,
+              title: p.serviceTitle,
+              price: p.servicePrice,
+              priceText: p.servicePriceText,
+              coverUrl: p.serviceCoverUrl,
+            }
+          : null,
         createdAt: p.createdAt,
         updatedAt: p.updatedAt,
         author: {

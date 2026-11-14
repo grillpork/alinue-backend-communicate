@@ -177,6 +177,11 @@ export const posts = pgTable("posts", {
 		foreignColumns: [users.id],
 		name: "posts_user_id_fkey"
 	}).onDelete("cascade"),
+	foreignKey({
+		columns: [table.serviceId],
+		foreignColumns: [services.id],
+		name: "posts_service_id_fkey"
+	}).onDelete("set null"),
 ]);
 
 export const postLikes = pgTable("post_likes", {
