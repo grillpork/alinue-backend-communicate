@@ -888,4 +888,41 @@ serviceRouter.post('/:id/like', requireAuth, async (c) => {
   }
 });
 
+/**
+ * 10. POST /api/services/:id/view - บันทึกยอดวิว (increment views_count)
+ */
+serviceRouter.post('/:id/view', optionalAuth, async (c) => {
+  try {
+    const serviceId = parseInt(c.req.param('id'), 10);
+    if (isNaN(serviceId)) {
+      return c.json({ success: false, message: 'Invalid service ID' }, 400);
+    }
+
+    const db = getDrizzle(c);
+
+    await db
+      .update(services)
+      .set({ viewsCount: sql`${services.viewsCount} + 1` })
+      .where(eq(services.id, serviceId));
+
+    const updated = await db
+      .select({ viewsCount: services.viewsCount })
+      .from(services)
+      .where(eq(services.id, serviceId))
+      .limit(1);
+
+    if (updated.length === 0) {
+      return c.json({ success: false, message: 'Service not found' }, 404);
+    }
+
+    return c.json({
+      success: true,
+      viewsCount: updated[0]?.viewsCount || 0,
+    });
+  } catch (err) {
+    console.error('View service error:', err);
+    return c.json({ success: false, message: 'Failed to record view' }, 500);
+  }
+});
+
 export default serviceRouter;
