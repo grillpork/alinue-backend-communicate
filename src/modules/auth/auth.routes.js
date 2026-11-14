@@ -356,6 +356,11 @@ auth.get("/google", (c) => {
   googleAuthUrl.searchParams.set("state", state);
   googleAuthUrl.searchParams.set("prompt", "select_account");
 
+  const isDirectBrowser = c.req.header("accept")?.includes("text/html");
+  if (isDirectBrowser) {
+    return c.redirect(googleAuthUrl.toString(), 302);
+  }
+
   return c.json({
     success: true,
     url: googleAuthUrl.toString(),
