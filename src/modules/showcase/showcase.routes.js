@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { getDrizzle, getDb } from '../../config/db.js';
-import { showcases, showcaseLikes, users, searchLogs } from '../../db/schema.js';
+import { showcases, showcaseLikes, users, searchLogs, services } from '../../db/schema.js';
 import { requireAuth, optionalAuth } from '../../middleware/auth.js';
 import {
   checkImageUrl,
@@ -74,6 +74,11 @@ showcaseRouter.get('/', optionalAuth, async (c) => {
         mediaType: showcases.mediaType,
         coverUrl: showcases.coverUrl,
         tags: showcases.tags,
+        serviceId: showcases.serviceId,
+        serviceTitle: services.title,
+        servicePrice: services.price,
+        servicePriceText: services.priceText,
+        serviceCoverUrl: services.coverUrl,
         likesCount: showcases.likesCount,
         viewsCount: showcases.viewsCount,
         createdAt: showcases.createdAt,
@@ -87,6 +92,7 @@ showcaseRouter.get('/', optionalAuth, async (c) => {
       })
       .from(showcases)
       .leftJoin(users, eq(showcases.userId, users.id))
+      .leftJoin(services, eq(showcases.serviceId, services.id))
       .where(and(...conditions))
       .orderBy(desc(showcases.createdAt))
       .limit(limit + 1)
@@ -104,6 +110,16 @@ showcaseRouter.get('/', optionalAuth, async (c) => {
       mediaType: s.mediaType || 'image',
       coverUrl: s.coverUrl || (Array.isArray(s.mediaUrls) && s.mediaUrls[0]) || null,
       tags: Array.isArray(s.tags) ? s.tags : [],
+      serviceId: s.serviceId || null,
+      service: s.serviceId
+        ? {
+            id: s.serviceId,
+            title: s.serviceTitle,
+            price: s.servicePrice ? Number(s.servicePrice) : null,
+            priceText: s.servicePriceText,
+            coverUrl: s.serviceCoverUrl,
+          }
+        : null,
       likesCount: s.likesCount || 0,
       viewsCount: s.viewsCount || 0,
       isLiked: Boolean(s.isLiked),
@@ -182,6 +198,11 @@ showcaseRouter.get('/:id', optionalAuth, async (c) => {
         mediaType: showcases.mediaType,
         coverUrl: showcases.coverUrl,
         tags: showcases.tags,
+        serviceId: showcases.serviceId,
+        serviceTitle: services.title,
+        servicePrice: services.price,
+        servicePriceText: services.priceText,
+        serviceCoverUrl: services.coverUrl,
         likesCount: showcases.likesCount,
         viewsCount: showcases.viewsCount,
         createdAt: showcases.createdAt,
@@ -195,6 +216,7 @@ showcaseRouter.get('/:id', optionalAuth, async (c) => {
       })
       .from(showcases)
       .leftJoin(users, eq(showcases.userId, users.id))
+      .leftJoin(services, eq(showcases.serviceId, services.id))
       .where(eq(showcases.id, showcaseId))
       .limit(1);
 
@@ -214,6 +236,16 @@ showcaseRouter.get('/:id', optionalAuth, async (c) => {
         mediaType: s.mediaType || 'image',
         coverUrl: s.coverUrl || (Array.isArray(s.mediaUrls) && s.mediaUrls[0]) || null,
         tags: Array.isArray(s.tags) ? s.tags : [],
+        serviceId: s.serviceId || null,
+        service: s.serviceId
+          ? {
+              id: s.serviceId,
+              title: s.serviceTitle,
+              price: s.servicePrice ? Number(s.servicePrice) : null,
+              priceText: s.servicePriceText,
+              coverUrl: s.serviceCoverUrl,
+            }
+          : null,
         likesCount: s.likesCount || 0,
         viewsCount: s.viewsCount || 0,
         isLiked: Boolean(s.isLiked),
@@ -270,6 +302,7 @@ showcaseRouter.post('/', requireAuth, async (c) => {
       mediaType = 'image',
       coverUrl = null,
       tags: rawTags = [],
+      serviceId = null,
     } = body;
 
     if (!title || !title.trim()) {
@@ -362,6 +395,7 @@ showcaseRouter.post('/', requireAuth, async (c) => {
         mediaType: finalMediaType,
         coverUrl: finalCoverUrl,
         tags: finalTags,
+        serviceId: serviceId ? parseInt(serviceId, 10) : null,
         likesCount: 0,
         viewsCount: 0,
         isPublished: true,
@@ -381,6 +415,7 @@ showcaseRouter.post('/', requireAuth, async (c) => {
           mediaType: s.mediaType || 'image',
           coverUrl: s.coverUrl,
           tags: Array.isArray(s.tags) ? s.tags : [],
+          serviceId: s.serviceId || null,
           likesCount: s.likesCount || 0,
           viewsCount: s.viewsCount || 0,
           createdAt: s.createdAt,
@@ -524,6 +559,8 @@ showcaseRouter.put('/:id', requireAuth, async (c) => {
       coverUrl,
       cover_url,
       tags,
+      serviceId,
+      service_id,
     } = body;
 
     const updateData = {
@@ -551,6 +588,10 @@ showcaseRouter.put('/:id', requireAuth, async (c) => {
     if (tags !== undefined && Array.isArray(tags)) {
       updateData.tags = tags.map((t) => String(t).trim().replace(/^#/, '')).filter(Boolean);
     }
+    const finalServiceId = serviceId !== undefined ? serviceId : service_id;
+    if (finalServiceId !== undefined) {
+      updateData.serviceId = finalServiceId ? parseInt(finalServiceId, 10) : null;
+    }
 
     const updated = await db
       .update(showcases)
@@ -572,6 +613,7 @@ showcaseRouter.put('/:id', requireAuth, async (c) => {
         mediaType: s.mediaType || 'image',
         coverUrl: s.coverUrl,
         tags: Array.isArray(s.tags) ? s.tags : [],
+        serviceId: s.serviceId || null,
         likesCount: s.likesCount || 0,
         viewsCount: s.viewsCount || 0,
         createdAt: s.createdAt,

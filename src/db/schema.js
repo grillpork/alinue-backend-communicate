@@ -252,6 +252,7 @@ export const showcases = pgTable("showcases", {
 	mediaType: varchar("media_type", { length: 50 }).default('image'),
 	coverUrl: varchar("cover_url", { length: 1000 }),
 	tags: jsonb().default([]),
+	serviceId: integer("service_id"),
 	likesCount: integer("likes_count").default(0).notNull(),
 	viewsCount: integer("views_count").default(0).notNull(),
 	isPublished: boolean("is_published").default(true).notNull(),
@@ -265,6 +266,11 @@ export const showcases = pgTable("showcases", {
 		foreignColumns: [users.id],
 		name: "showcases_user_id_fkey"
 	}).onDelete("cascade"),
+	foreignKey({
+		columns: [table.serviceId],
+		foreignColumns: [services.id],
+		name: "showcases_service_id_fkey"
+	}).onDelete("set null"),
 ]);
 
 export const showcaseLikes = pgTable("showcase_likes", {
