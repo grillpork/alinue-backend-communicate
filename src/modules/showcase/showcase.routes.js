@@ -34,7 +34,7 @@ showcaseRouter.get('/', optionalAuth, async (c) => {
       const uRes = await db
         .select({ id: users.id })
         .from(users)
-        .where(sql`LOWER(${users.username}) = ${username}`)
+        .where(ilike(users.username, username))
         .limit(1);
 
       if (uRes.length > 0) {
@@ -144,7 +144,12 @@ showcaseRouter.get('/', optionalAuth, async (c) => {
     });
   } catch (err) {
     console.error('Get showcases error:', err);
-    return c.json({ success: false, message: 'Failed to fetch showcases', error: err?.message }, 500);
+    return c.json({
+      success: false,
+      message: 'Failed to fetch showcases',
+      error: err?.message,
+      cause: String(err?.cause?.message || err?.cause || err?.sourceError || ''),
+    }, 500);
   }
 });
 

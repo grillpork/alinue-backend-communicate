@@ -214,7 +214,7 @@ userRouter.get('/profile/:username', optionalAuth, async (c) => {
         createdAt: users.createdAt,
       })
       .from(users)
-      .where(sql`LOWER(${users.username}) = ${username}`)
+      .where(ilike(users.username, username))
       .limit(1);
 
     if (userList.length === 0) {
@@ -330,7 +330,7 @@ userRouter.patch('/profile', requireAuth, async (c) => {
       const existing = await db
         .select({ id: users.id })
         .from(users)
-        .where(and(sql`LOWER(${users.username}) = ${cleanUsername}`, ne(users.id, user.id)))
+        .where(and(ilike(users.username, cleanUsername), ne(users.id, user.id)))
         .limit(1);
 
       if (existing.length > 0) {
@@ -396,7 +396,7 @@ userRouter.post('/:id/follow', requireAuth, async (c) => {
       const uRes = await db
         .select({ id: users.id })
         .from(users)
-        .where(sql`LOWER(${users.username}) = ${rawId.toLowerCase()}`)
+        .where(ilike(users.username, rawId.trim()))
         .limit(1);
       if (uRes.length > 0) {
         targetId = uRes[0].id;
@@ -483,7 +483,7 @@ userRouter.get('/:id/posts', optionalAuth, async (c) => {
       const uRes = await db
         .select({ id: users.id })
         .from(users)
-        .where(sql`LOWER(${users.username}) = ${rawParam.toLowerCase()}`)
+        .where(ilike(users.username, rawParam.trim()))
         .limit(1);
 
       if (uRes.length === 0) {
@@ -583,7 +583,7 @@ userRouter.get('/:id/likes', optionalAuth, async (c) => {
       const uRes = await db
         .select({ id: users.id })
         .from(users)
-        .where(sql`LOWER(${users.username}) = ${rawParam.toLowerCase()}`)
+        .where(ilike(users.username, rawParam.trim()))
         .limit(1);
 
       if (uRes.length === 0) {
