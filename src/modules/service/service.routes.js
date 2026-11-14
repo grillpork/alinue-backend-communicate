@@ -129,6 +129,11 @@ serviceRouter.get('/', optionalAuth, async (c) => {
         authorUsername: users.username,
         authorName: users.displayName,
         authorAvatar: users.avatarUrl,
+        authorSocialLinks: users.socialLinks,
+        authorWebsite: users.website,
+        authorTwitter: users.twitter,
+        authorDiscord: users.discord,
+        authorArtstation: users.artstation,
         isLiked: currentUser?.id
           ? sql`EXISTS(SELECT 1 FROM service_likes sl WHERE sl.service_id = ${services.id} AND sl.user_id = ${currentUser.id})`
           : sql`false`,
@@ -181,6 +186,11 @@ serviceRouter.get('/', optionalAuth, async (c) => {
           name: s.authorName || s.authorUsername || 'Creator',
           username: s.authorUsername || 'user',
           avatar: s.authorAvatar || null,
+          socialLinks: s.authorSocialLinks || {},
+          website: s.authorWebsite || null,
+          twitter: s.authorTwitter || null,
+          discord: s.authorDiscord || null,
+          artstation: s.authorArtstation || null,
         },
       };
     });
@@ -335,6 +345,11 @@ serviceRouter.get('/:id', optionalAuth, async (c) => {
         authorUsername: users.username,
         authorName: users.displayName,
         authorAvatar: users.avatarUrl,
+        authorSocialLinks: users.socialLinks,
+        authorWebsite: users.website,
+        authorTwitter: users.twitter,
+        authorDiscord: users.discord,
+        authorArtstation: users.artstation,
         isLiked: currentUser?.id
           ? sql`EXISTS(SELECT 1 FROM service_likes sl WHERE sl.service_id = ${services.id} AND sl.user_id = ${currentUser.id})`
           : sql`false`,
@@ -389,6 +404,11 @@ serviceRouter.get('/:id', optionalAuth, async (c) => {
           name: s.authorName || s.authorUsername || 'Creator',
           username: s.authorUsername || 'user',
           avatar: s.authorAvatar || null,
+          socialLinks: s.authorSocialLinks || {},
+          website: s.authorWebsite || null,
+          twitter: s.authorTwitter || null,
+          discord: s.authorDiscord || null,
+          artstation: s.authorArtstation || null,
         },
       },
     });
@@ -586,6 +606,11 @@ serviceRouter.post('/', requireAuth, async (c) => {
             name: user.displayName || user.username || 'You',
             username: user.username,
             avatar: user.avatarUrl,
+            socialLinks: user.socialLinks || {},
+            website: user.website || null,
+            twitter: user.twitter || null,
+            discord: user.discord || null,
+            artstation: user.artstation || null,
           },
         },
       },
