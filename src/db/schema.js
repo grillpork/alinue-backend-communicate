@@ -386,6 +386,8 @@ export const services = pgTable("services", {
 	tags: jsonb().default([]),
 	price: numeric({ precision: 12, scale: 2 }),
 	priceText: varchar("price_text", { length: 100 }),
+	startPrice: numeric("start_price", { precision: 12, scale: 2 }),
+	endPrice: numeric("end_price", { precision: 12, scale: 2 }),
 	status: varchar({ length: 50 }).default('active').notNull(),
 	expiresAt: timestamp("expires_at", { withTimezone: true, mode: 'string' }).notNull(),
 	likesCount: integer("likes_count").default(0).notNull(),

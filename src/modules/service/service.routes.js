@@ -118,6 +118,8 @@ serviceRouter.get('/', optionalAuth, async (c) => {
         tags: services.tags,
         price: services.price,
         priceText: services.priceText,
+        startPrice: services.startPrice,
+        endPrice: services.endPrice,
         status: services.status,
         expiresAt: services.expiresAt,
         likesCount: services.likesCount,
@@ -159,6 +161,11 @@ serviceRouter.get('/', optionalAuth, async (c) => {
         tags: Array.isArray(s.tags) ? s.tags : [],
         price: s.price ? Number(s.price) : null,
         priceText: s.priceText || null,
+        startPrice: s.startPrice ? Number(s.startPrice) : null,
+        endPrice: s.endPrice ? Number(s.endPrice) : null,
+        priceText: s.priceText || null,
+        startPrice: s.startPrice ? Number(s.startPrice) : null,
+        endPrice: s.endPrice ? Number(s.endPrice) : null,
         status: isExpired ? 'expired' : s.status,
         expiresAt: s.expiresAt,
         isExpired,
@@ -224,6 +231,8 @@ serviceRouter.get('/my', requireAuth, async (c) => {
         tags: services.tags,
         price: services.price,
         priceText: services.priceText,
+        startPrice: services.startPrice,
+        endPrice: services.endPrice,
         status: services.status,
         expiresAt: services.expiresAt,
         likesCount: services.likesCount,
@@ -259,6 +268,9 @@ serviceRouter.get('/my', requireAuth, async (c) => {
         coverUrl: s.coverUrl || rawImages[0] || null,
         tags: Array.isArray(s.tags) ? s.tags : [],
         price: s.price ? Number(s.price) : null,
+        priceText: s.priceText || null,
+        startPrice: s.startPrice ? Number(s.startPrice) : null,
+        endPrice: s.endPrice ? Number(s.endPrice) : null,
         status: computedStatus,
         isExpired,
         daysLeft,
@@ -312,6 +324,8 @@ serviceRouter.get('/:id', optionalAuth, async (c) => {
         tags: services.tags,
         price: services.price,
         priceText: services.priceText,
+        startPrice: services.startPrice,
+        endPrice: services.endPrice,
         status: services.status,
         expiresAt: services.expiresAt,
         likesCount: services.likesCount,
@@ -354,6 +368,11 @@ serviceRouter.get('/:id', optionalAuth, async (c) => {
         tags: Array.isArray(s.tags) ? s.tags : [],
         price: s.price ? Number(s.price) : null,
         priceText: s.priceText || null,
+        startPrice: s.startPrice ? Number(s.startPrice) : null,
+        endPrice: s.endPrice ? Number(s.endPrice) : null,
+        priceText: s.priceText || null,
+        startPrice: s.startPrice ? Number(s.startPrice) : null,
+        endPrice: s.endPrice ? Number(s.endPrice) : null,
         status: isExpired ? 'expired' : s.status,
         expiresAt: s.expiresAt,
         isExpired,
@@ -419,6 +438,10 @@ serviceRouter.post('/', requireAuth, async (c) => {
       tags: rawTags = [],
       price = null,
       priceText = null,
+      startPrice = null,
+      endPrice = null,
+      start_price = null,
+      end_price = null,
       durationDays = 30, // อายุของโพสต์รับงาน ค่าเริ่มต้นคือ 30 วัน (1 เดือน)
     } = body;
 
@@ -488,6 +511,27 @@ serviceRouter.post('/', requireAuth, async (c) => {
     const validDays = Math.min(60, Math.max(1, parseInt(durationDays, 10) || 30));
     const expiresAt = new Date(Date.now() + validDays * 24 * 60 * 60 * 1000).toISOString();
 
+    // คำนวณ start_price, end_price และ priceText ให้ได้รูปแบบ ฿ start_price - end_price
+    const finalStartPrice = start_price !== null && start_price !== undefined
+      ? start_price
+      : startPrice !== null && startPrice !== undefined
+      ? startPrice
+      : price;
+    const finalEndPrice = end_price !== null && end_price !== undefined
+      ? end_price
+      : endPrice !== null && endPrice !== undefined
+      ? endPrice
+      : null;
+
+    let computedPriceText = priceText ? priceText.trim() : null;
+    if (!computedPriceText && finalStartPrice !== null && finalStartPrice !== undefined) {
+      if (finalEndPrice !== null && finalEndPrice !== undefined && Number(finalEndPrice) > Number(finalStartPrice)) {
+        computedPriceText = `฿${Number(finalStartPrice).toLocaleString()} - ฿${Number(finalEndPrice).toLocaleString()}`;
+      } else {
+        computedPriceText = `฿${Number(finalStartPrice).toLocaleString()}`;
+      }
+    }
+
     const inserted = await db
       .insert(services)
       .values({
@@ -497,8 +541,10 @@ serviceRouter.post('/', requireAuth, async (c) => {
         images: finalImages,
         coverUrl: finalCoverUrl,
         tags: finalTags,
-        price: price ? String(price) : null,
-        priceText: priceText ? priceText.trim() : null,
+        price: finalStartPrice ? String(finalStartPrice) : null,
+        priceText: computedPriceText,
+        startPrice: finalStartPrice ? String(finalStartPrice) : null,
+        endPrice: finalEndPrice ? String(finalEndPrice) : null,
         status: 'active',
         expiresAt,
         likesCount: 0,
@@ -524,6 +570,8 @@ serviceRouter.post('/', requireAuth, async (c) => {
           tags: Array.isArray(s.tags) ? s.tags : [],
           price: s.price ? Number(s.price) : null,
           priceText: s.priceText || null,
+          startPrice: s.startPrice ? Number(s.startPrice) : null,
+          endPrice: s.endPrice ? Number(s.endPrice) : null,
           status: s.status,
           expiresAt: s.expiresAt,
           isExpired,
@@ -587,6 +635,10 @@ serviceRouter.put('/:id', requireAuth, async (c) => {
       tags,
       price,
       priceText,
+      startPrice,
+      endPrice,
+      start_price,
+      end_price,
       status,
       isPublished,
     } = body;
@@ -613,11 +665,29 @@ serviceRouter.put('/:id', requireAuth, async (c) => {
         ? tags.map((t) => String(t).trim().replace(/^#/, '')).filter(Boolean)
         : [];
     }
-    if (price !== undefined) {
-      updateData.price = price !== null ? String(price) : null;
+    const finalStart = start_price !== undefined ? start_price : startPrice !== undefined ? startPrice : price;
+    const finalEnd = end_price !== undefined ? end_price : endPrice;
+
+    if (finalStart !== undefined) {
+      updateData.startPrice = finalStart !== null ? String(finalStart) : null;
+      updateData.price = finalStart !== null ? String(finalStart) : null;
     }
+    if (finalEnd !== undefined) {
+      updateData.endPrice = finalEnd !== null ? String(finalEnd) : null;
+    }
+
     if (priceText !== undefined) {
       updateData.priceText = priceText ? String(priceText).trim() : null;
+    } else if (finalStart !== undefined || finalEnd !== undefined) {
+      const sVal = finalStart !== undefined ? finalStart : existing[0].startPrice || existing[0].price;
+      const eVal = finalEnd !== undefined ? finalEnd : existing[0].endPrice;
+      if (sVal !== null && sVal !== undefined) {
+        if (eVal !== null && eVal !== undefined && Number(eVal) > Number(sVal)) {
+          updateData.priceText = `฿${Number(sVal).toLocaleString()} - ฿${Number(eVal).toLocaleString()}`;
+        } else {
+          updateData.priceText = `฿${Number(sVal).toLocaleString()}`;
+        }
+      }
     }
     if (status !== undefined) {
       updateData.status = status;
@@ -641,6 +711,9 @@ serviceRouter.put('/:id', requireAuth, async (c) => {
       service: {
         ...s,
         price: s.price ? Number(s.price) : null,
+        priceText: s.priceText || null,
+        startPrice: s.startPrice ? Number(s.startPrice) : null,
+        endPrice: s.endPrice ? Number(s.endPrice) : null,
         isExpired,
         daysLeft,
         hoursLeft,
@@ -746,6 +819,9 @@ serviceRouter.post('/:id/renew', requireAuth, async (c) => {
       service: {
         ...s,
         price: s.price ? Number(s.price) : null,
+        priceText: s.priceText || null,
+        startPrice: s.startPrice ? Number(s.startPrice) : null,
+        endPrice: s.endPrice ? Number(s.endPrice) : null,
         isExpired,
         daysLeft,
         hoursLeft,
