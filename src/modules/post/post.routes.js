@@ -490,7 +490,75 @@ postRouter.get('/:id', optionalAuth, async (c) => {
 });
 
 /**
- * 4. DELETE /api/posts/:id - ลบโพสต์
+ * 4. PUT /api/posts/:id - แก้ไขโพสต์
+ */
+postRouter.put('/:id', requireAuth, async (c) => {
+  try {
+    const postId = parseInt(c.req.param('id'), 10);
+    const user = c.get('user');
+    const db = getDrizzle(c);
+
+    const postRows = await db
+      .select({ id: posts.id, userId: posts.userId })
+      .from(posts)
+      .where(eq(posts.id, postId))
+      .limit(1);
+
+    if (postRows.length === 0) {
+      return c.json({ success: false, message: 'Post not found' }, 404);
+    }
+
+    if (postRows[0].userId !== user.id) {
+      return c.json(
+        { success: false, message: 'You are not authorized to edit this post' },
+        403
+      );
+    }
+
+    const body = await c.req.json();
+    const { content, images, mediaUrls, serviceId, serviceTitle } = body;
+
+    const updateData = {
+      updatedAt: sql`NOW()`,
+    };
+
+    if (content !== undefined) {
+      updateData.caption = content ? String(content).trim() : '';
+    }
+
+    const finalImgs = images !== undefined ? images : mediaUrls;
+    if (finalImgs !== undefined && Array.isArray(finalImgs)) {
+      updateData.mediaUrls = finalImgs.map((img) =>
+        typeof img === 'string' ? img : img.url
+      );
+    }
+
+    if (serviceId !== undefined) {
+      updateData.serviceId = serviceId ? Number(serviceId) : null;
+    }
+    if (serviceTitle !== undefined) {
+      updateData.serviceTitle = serviceTitle || null;
+    }
+
+    const updated = await db
+      .update(posts)
+      .set(updateData)
+      .where(eq(posts.id, postId))
+      .returning();
+
+    return c.json({
+      success: true,
+      message: 'Post updated successfully',
+      post: updated[0],
+    });
+  } catch (err) {
+    console.error('Update post error:', err);
+    return c.json({ success: false, message: 'Failed to update post' }, 500);
+  }
+});
+
+/**
+ * 5. DELETE /api/posts/:id - ลบโพสต์
  */
 postRouter.delete('/:id', requireAuth, async (c) => {
   try {
