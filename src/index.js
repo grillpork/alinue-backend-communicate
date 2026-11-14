@@ -6,9 +6,10 @@ import postRouter from './modules/post/post.routes';
 import userRouter from './modules/user/user.routes';
 import upload from './modules/upload/upload.routes';
 import showcaseRouter from './modules/showcase/showcase.routes';
+import serviceRouter from './modules/service/service.routes';
 import adminRouter from './modules/admin/admin.routes';
 import notificationRouter from './modules/notification/notification.routes';
-import storyRouter from './modules/story/story.routes';
+import { getDb } from './config/db';
 
 const app = new Hono();
 
@@ -52,19 +53,53 @@ app.use('*', async (c, next) => {
   await next();
 });
 
+// Database Warmup Middleware (เรียก getDb เพื่อ trigger connection log ใน Request แรก)
+let isDbWarmupDone = false;
+app.use('*', async (c, next) => {
+  if (!isDbWarmupDone) {
+    try {
+      getDb(c);
+      isDbWarmupDone = true;
+    } catch (err) {
+      console.error('❌ [Database] Initialization failed:', err.message);
+    }
+  }
+  await next();
+});
+
 // Root / Health Check
 app.get('/', (c) => {
   return c.json({
     status: 'online',
     service: 'Alinue Backend API',
-    database: 'Neon PostgreSQL',
+    database: 'PostgreSQL (VPS)',
     storage: 'Cloudflare R2',
     timestamp: new Date().toISOString(),
   });
 });
 
-app.get('/health', (c) => {
-  return c.json({ status: 'healthy', uptime: process.uptime ? process.uptime() : undefined });
+app.get('/health', async (c) => {
+  try {
+    const sql = getDb(c);
+    const start = Date.now();
+    await sql`SELECT 1`;
+    const latency = Date.now() - start;
+    return c.json({
+      status: 'healthy',
+      database: 'connected',
+      latency: `${latency}ms`,
+      uptime: process.uptime ? process.uptime() : undefined,
+    });
+  } catch (err) {
+    return c.json(
+      {
+        status: 'unhealthy',
+        database: 'disconnected',
+        error: err.message,
+      },
+      500
+    );
+  }
 });
 
 // Mount Modules
@@ -73,10 +108,10 @@ app.route('/api/posts', postRouter);
 app.route('/api/users', userRouter);
 app.route('/api/upload', upload);
 app.route('/api/showcases', showcaseRouter);
+app.route('/api/services', serviceRouter);
 app.route('/api/admin', adminRouter);
 app.route('/admin', adminRouter);
 app.route('/api/notifications', notificationRouter);
-app.route('/api/stories', storyRouter);
 
 // 404 Handler
 app.notFound((c) => {

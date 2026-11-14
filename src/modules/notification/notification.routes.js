@@ -1,6 +1,8 @@
 import { Hono } from 'hono';
-import { getDb } from '../../config/db';
-import { requireAuth } from '../../middleware/auth';
+import { getDrizzle } from '../../config/db.js';
+import { notifications, users, posts, showcases } from '../../db/schema.js';
+import { requireAuth } from '../../middleware/auth.js';
+import { eq, and, inArray, desc, count, sql } from 'drizzle-orm';
 
 const notificationRouter = new Hono();
 
@@ -11,7 +13,7 @@ const notificationRouter = new Hono();
 notificationRouter.get('/', requireAuth, async (c) => {
   try {
     const user = c.get('user');
-    const sql = getDb(c);
+    const db = getDrizzle(c);
 
     const filter = c.req.query('filter') || 'all';
     const page = Math.max(1, parseInt(c.req.query('page') || '1', 10));
@@ -19,104 +21,100 @@ notificationRouter.get('/', requireAuth, async (c) => {
     const offset = (page - 1) * limit;
 
     // เงื่อนไข Filter
-    let filterCondition = sql``;
+    const conditions = [eq(notifications.userId, user.id)];
     if (filter === 'follows') {
-      filterCondition = sql`AND n.type = 'follow'`;
+      conditions.push(eq(notifications.type, 'follow'));
     } else if (filter === 'replies') {
-      filterCondition = sql`AND n.type IN ('comment', 'mention')`;
+      conditions.push(inArray(notifications.type, ['comment', 'mention']));
     } else if (filter === 'likes') {
-      filterCondition = sql`AND n.type IN ('like', 'showcase_like')`;
+      conditions.push(inArray(notifications.type, ['like', 'showcase_like']));
     } else if (filter === 'showcase') {
-      filterCondition = sql`AND n.entity_type = 'showcase'`;
+      conditions.push(eq(notifications.entityType, 'showcase'));
     }
 
+    const whereClause = and(...conditions);
+
     // ดึงข้อมูลแจ้งเตือนพร้อม Actor, Post, และ Showcase
-    const notifications = await sql`
-      SELECT 
-        n.id,
-        n.user_id,
-        n.actor_id,
-        n.type,
-        n.entity_id,
-        n.entity_type,
-        n.message,
-        n.is_read,
-        n."createdAt",
-        u.username as actor_username,
-        u."displayName" as actor_name,
-        u."avatarUrl" as actor_avatar,
-        p.caption as post_caption,
-        p.media_urls as post_media,
-        s.title as showcase_title,
-        s.cover_url as showcase_cover,
-        s.media_urls as showcase_media,
-        EXISTS(
-          SELECT 1 FROM follows f 
-          WHERE f.follower_id = ${user.id} AND f.following_id = n.actor_id
-        ) as is_actor_following
-      FROM notifications n
-      JOIN users u ON n.actor_id = u.id
-      LEFT JOIN posts p ON (n.entity_type = 'post' AND n.entity_id = p.id)
-      LEFT JOIN showcases s ON (n.entity_type = 'showcase' AND n.entity_id = s.id)
-      WHERE n.user_id = ${user.id}
-      ${filterCondition}
-      ORDER BY n."createdAt" DESC
-      LIMIT ${limit} OFFSET ${offset}
-    `;
+    const notifList = await db
+      .select({
+        id: notifications.id,
+        userId: notifications.userId,
+        actorId: notifications.actorId,
+        type: notifications.type,
+        entityId: notifications.entityId,
+        entityType: notifications.entityType,
+        message: notifications.message,
+        isRead: notifications.isRead,
+        createdAt: notifications.createdAt,
+        actorUsername: users.username,
+        actorName: users.displayName,
+        actorAvatar: users.avatarUrl,
+        postCaption: posts.caption,
+        postMedia: posts.mediaUrls,
+        showcaseTitle: showcases.title,
+        showcaseCover: showcases.coverUrl,
+        showcaseMedia: showcases.mediaUrls,
+        isActorFollowing: sql`EXISTS(SELECT 1 FROM follows f WHERE f.follower_id = ${user.id} AND f.following_id = ${notifications.actorId})`,
+      })
+      .from(notifications)
+      .innerJoin(users, eq(notifications.actorId, users.id))
+      .leftJoin(posts, and(eq(notifications.entityType, 'post'), eq(notifications.entityId, posts.id)))
+      .leftJoin(showcases, and(eq(notifications.entityType, 'showcase'), eq(notifications.entityId, showcases.id)))
+      .where(whereClause)
+      .orderBy(desc(notifications.createdAt))
+      .limit(limit)
+      .offset(offset);
 
     // นับจำนวน Unread ทั้งหมด
-    const unreadRes = await sql`
-      SELECT COUNT(*)::int as count 
-      FROM notifications 
-      WHERE user_id = ${user.id} AND is_read = false
-    `;
-    const unreadCount = unreadRes[0]?.count || 0;
+    const unreadRes = await db
+      .select({ count: count() })
+      .from(notifications)
+      .where(and(eq(notifications.userId, user.id), eq(notifications.isRead, false)));
+    const unreadCount = Number(unreadRes[0]?.count || 0);
 
     // นับจำนวนทั้งหมดตาม filter
-    const totalRes = await sql`
-      SELECT COUNT(*)::int as count 
-      FROM notifications n
-      WHERE n.user_id = ${user.id}
-      ${filterCondition}
-    `;
-    const totalCount = totalRes[0]?.count || 0;
+    const totalRes = await db
+      .select({ count: count() })
+      .from(notifications)
+      .where(whereClause);
+    const totalCount = Number(totalRes[0]?.count || 0);
 
-    const formatted = notifications.map((n) => {
+    const formatted = notifList.map((n) => {
       // ดึง Thumbnail รูปภาพของโพสต์ (ถ้ามี)
       let postThumbnail = null;
-      if (Array.isArray(n.post_media) && n.post_media.length > 0) {
-        postThumbnail = typeof n.post_media[0] === 'string' ? n.post_media[0] : n.post_media[0]?.url;
+      if (Array.isArray(n.postMedia) && n.postMedia.length > 0) {
+        postThumbnail = typeof n.postMedia[0] === 'string' ? n.postMedia[0] : n.postMedia[0]?.url;
       }
 
       // ดึง Thumbnail รูปภาพของ Showcase (ถ้ามี)
-      let showcaseThumbnail = n.showcase_cover;
-      if (!showcaseThumbnail && Array.isArray(n.showcase_media) && n.showcase_media.length > 0) {
-        showcaseThumbnail = typeof n.showcase_media[0] === 'string' ? n.showcase_media[0] : n.showcase_media[0]?.url;
+      let showcaseThumbnail = n.showcaseCover;
+      if (!showcaseThumbnail && Array.isArray(n.showcaseMedia) && n.showcaseMedia.length > 0) {
+        showcaseThumbnail = typeof n.showcaseMedia[0] === 'string' ? n.showcaseMedia[0] : n.showcaseMedia[0]?.url;
       }
 
       return {
         id: n.id,
         type: n.type,
-        isRead: Boolean(n.is_read),
+        isRead: Boolean(n.isRead),
         createdAt: n.createdAt,
         message: n.message,
-        entityId: n.entity_id,
-        entityType: n.entity_type,
+        entityId: n.entityId,
+        entityType: n.entityType,
         actor: {
-          id: n.actor_id,
-          name: n.actor_name || n.actor_username || 'User',
-          username: n.actor_username,
-          avatar: n.actor_avatar || null,
-          isFollowing: Boolean(n.is_actor_following),
+          id: n.actorId,
+          name: n.actorName || n.actorUsername || 'User',
+          username: n.actorUsername,
+          avatar: n.actorAvatar || null,
+          isFollowing: Boolean(n.isActorFollowing),
         },
-        post: n.post_caption !== undefined && n.entity_type === 'post' ? {
-          id: n.entity_id,
-          caption: n.post_caption,
+        post: n.postCaption !== undefined && n.entityType === 'post' ? {
+          id: n.entityId,
+          caption: n.postCaption,
           thumbnail: postThumbnail,
         } : null,
-        showcase: n.showcase_title !== undefined && n.entity_type === 'showcase' ? {
-          id: n.entity_id,
-          title: n.showcase_title,
+        showcase: n.showcaseTitle !== undefined && n.entityType === 'showcase' ? {
+          id: n.entityId,
+          title: n.showcaseTitle,
           coverUrl: showcaseThumbnail,
         } : null,
       };
@@ -145,17 +143,16 @@ notificationRouter.get('/', requireAuth, async (c) => {
 notificationRouter.get('/unread-count', requireAuth, async (c) => {
   try {
     const user = c.get('user');
-    const sql = getDb(c);
+    const db = getDrizzle(c);
 
-    const res = await sql`
-      SELECT COUNT(*)::int as count 
-      FROM notifications 
-      WHERE user_id = ${user.id} AND is_read = false
-    `;
+    const res = await db
+      .select({ count: count() })
+      .from(notifications)
+      .where(and(eq(notifications.userId, user.id), eq(notifications.isRead, false)));
 
     return c.json({
       success: true,
-      unreadCount: res[0]?.count || 0,
+      unreadCount: Number(res[0]?.count || 0),
     });
   } catch (err) {
     console.error('Get unread count error:', err);
@@ -169,13 +166,12 @@ notificationRouter.get('/unread-count', requireAuth, async (c) => {
 notificationRouter.patch('/read-all', requireAuth, async (c) => {
   try {
     const user = c.get('user');
-    const sql = getDb(c);
+    const db = getDrizzle(c);
 
-    await sql`
-      UPDATE notifications 
-      SET is_read = true 
-      WHERE user_id = ${user.id} AND is_read = false
-    `;
+    await db
+      .update(notifications)
+      .set({ isRead: true })
+      .where(and(eq(notifications.userId, user.id), eq(notifications.isRead, false)));
 
     return c.json({
       success: true,
@@ -194,13 +190,12 @@ notificationRouter.patch('/:id/read', requireAuth, async (c) => {
   try {
     const user = c.get('user');
     const notifId = parseInt(c.req.param('id'), 10);
-    const sql = getDb(c);
+    const db = getDrizzle(c);
 
-    await sql`
-      UPDATE notifications 
-      SET is_read = true 
-      WHERE id = ${notifId} AND user_id = ${user.id}
-    `;
+    await db
+      .update(notifications)
+      .set({ isRead: true })
+      .where(and(eq(notifications.id, notifId), eq(notifications.userId, user.id)));
 
     return c.json({
       success: true,
@@ -219,12 +214,11 @@ notificationRouter.delete('/:id', requireAuth, async (c) => {
   try {
     const user = c.get('user');
     const notifId = parseInt(c.req.param('id'), 10);
-    const sql = getDb(c);
+    const db = getDrizzle(c);
 
-    await sql`
-      DELETE FROM notifications 
-      WHERE id = ${notifId} AND user_id = ${user.id}
-    `;
+    await db
+      .delete(notifications)
+      .where(and(eq(notifications.id, notifId), eq(notifications.userId, user.id)));
 
     return c.json({
       success: true,
@@ -237,4 +231,3 @@ notificationRouter.delete('/:id', requireAuth, async (c) => {
 });
 
 export default notificationRouter;
-

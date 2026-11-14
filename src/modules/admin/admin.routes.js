@@ -1,10 +1,12 @@
 import { Hono } from 'hono';
-import { getDb } from '../../config/db';
-import { optionalAuth } from '../../middleware/auth';
+import { getDrizzle, getDb } from '../../config/db.js';
+import { optionalAuth } from '../../middleware/auth.js';
 import {
   ensureModerationLogsTable,
   reviewModerationAppeal,
-} from '../../utils/moderation';
+} from '../../utils/moderation.js';
+import { moderationAppeals, moderationLogs, users } from '../../db/schema.js';
+import { eq, and, or, ilike, sql, desc, count } from 'drizzle-orm';
 
 const adminRouter = new Hono();
 
@@ -14,28 +16,29 @@ const adminRouter = new Hono();
  */
 adminRouter.get('/moderation/stats', optionalAuth, async (c) => {
   try {
-    const sql = getDb(c);
-    await ensureModerationLogsTable(sql);
+    const rawSql = getDb(c);
+    await ensureModerationLogsTable(rawSql);
+    const db = getDrizzle(c);
 
-    const appealsStat = await sql`
-      SELECT
-        COUNT(*) FILTER (WHERE status = 'pending') as pending_appeals,
-        COUNT(*) FILTER (WHERE status = 'approved') as approved_appeals,
-        COUNT(*) FILTER (WHERE status = 'rejected') as rejected_appeals,
-        COUNT(*) as total_appeals
-      FROM moderation_appeals
-    `;
+    const appealsStat = await db
+      .select({
+        pending_appeals: sql`COUNT(*) FILTER (WHERE ${moderationAppeals.status} = 'pending')`,
+        approved_appeals: sql`COUNT(*) FILTER (WHERE ${moderationAppeals.status} = 'approved')`,
+        rejected_appeals: sql`COUNT(*) FILTER (WHERE ${moderationAppeals.status} = 'rejected')`,
+        total_appeals: sql`COUNT(*)`,
+      })
+      .from(moderationAppeals);
 
-    const logsStat = await sql`
-      SELECT
-        COUNT(*) as total_logs,
-        COUNT(*) FILTER (WHERE is_safe = false) as total_blocked,
-        COUNT(*) FILTER (WHERE is_safe = false AND "createdAt" >= NOW() - INTERVAL '24 hours') as blocked_24h,
-        COUNT(*) FILTER (WHERE reasons::text ILIKE '%Nudity%') as nudity_count,
-        COUNT(*) FILTER (WHERE reasons::text ILIKE '%Weapon%') as weapon_count,
-        COUNT(*) FILTER (WHERE reasons::text ILIKE '%Gore%' OR reasons::text ILIKE '%Violence%') as gore_count
-      FROM moderation_logs
-    `;
+    const logsStat = await db
+      .select({
+        total_logs: sql`COUNT(*)`,
+        total_blocked: sql`COUNT(*) FILTER (WHERE ${moderationLogs.isSafe} = false)`,
+        blocked_24h: sql`COUNT(*) FILTER (WHERE ${moderationLogs.isSafe} = false AND ${moderationLogs.createdAt} >= NOW() - INTERVAL '24 hours')`,
+        nudity_count: sql`COUNT(*) FILTER (WHERE ${moderationLogs.reasons}::text ILIKE '%Nudity%')`,
+        weapon_count: sql`COUNT(*) FILTER (WHERE ${moderationLogs.reasons}::text ILIKE '%Weapon%')`,
+        gore_count: sql`COUNT(*) FILTER (WHERE ${moderationLogs.reasons}::text ILIKE '%Gore%' OR ${moderationLogs.reasons}::text ILIKE '%Violence%')`,
+      })
+      .from(moderationLogs);
 
     const pendingAppeals = parseInt(appealsStat[0]?.pending_appeals || '0', 10);
     const approvedAppeals = parseInt(appealsStat[0]?.approved_appeals || '0', 10);
@@ -81,53 +84,56 @@ adminRouter.get('/moderation/stats', optionalAuth, async (c) => {
  */
 adminRouter.get('/moderation/appeals', optionalAuth, async (c) => {
   try {
-    const sql = getDb(c);
-    await ensureModerationLogsTable(sql);
+    const rawSql = getDb(c);
+    await ensureModerationLogsTable(rawSql);
+    const db = getDrizzle(c);
 
     const status = c.req.query('status') || 'pending';
     const page = Math.max(1, parseInt(c.req.query('page') || '1', 10));
     const limit = Math.min(50, Math.max(1, parseInt(c.req.query('limit') || '20', 10)));
     const offset = (page - 1) * limit;
 
-    const appeals = await sql`
-      SELECT 
-        a.id,
-        a.log_id,
-        a.user_id,
-        a.ip_address,
-        a.image_url,
-        a.file_key,
-        a.reasons,
-        a.appeal_reason,
-        a.status,
-        a.reviewer_id,
-        a.reviewer_note,
-        a.reviewed_at,
-        a."createdAt",
-        a."updatedAt",
-        u.username,
-        u."displayName",
-        u."avatarUrl",
-        u.email,
-        r.username as reviewer_username,
-        r."displayName" as reviewer_name
-      FROM moderation_appeals a
-      LEFT JOIN users u ON a.user_id = u.id
-      LEFT JOIN users r ON a.reviewer_id = r.id
-      WHERE 
-        ${status === 'all' ? sql`1=1` : sql`a.status = ${status}`}
-      ORDER BY 
-        CASE WHEN a.status = 'pending' THEN 0 ELSE 1 END,
-        a."createdAt" DESC
-      LIMIT ${limit} OFFSET ${offset}
-    `;
+    const statusCondition = status === 'all' ? undefined : eq(moderationAppeals.status, status);
 
-    const totalCountRes = await sql`
-      SELECT COUNT(*)::int as count 
-      FROM moderation_appeals
-      WHERE ${status === 'all' ? sql`1=1` : sql`status = ${status}`}
-    `;
-    const total = totalCountRes[0]?.count || 0;
+    const appeals = await db
+      .select({
+        id: moderationAppeals.id,
+        logId: moderationAppeals.logId,
+        userId: moderationAppeals.userId,
+        ipAddress: moderationAppeals.ipAddress,
+        imageUrl: moderationAppeals.imageUrl,
+        fileKey: moderationAppeals.fileKey,
+        reasons: moderationAppeals.reasons,
+        appealReason: moderationAppeals.appealReason,
+        status: moderationAppeals.status,
+        reviewerId: moderationAppeals.reviewerId,
+        reviewerNote: moderationAppeals.reviewerNote,
+        reviewedAt: moderationAppeals.reviewedAt,
+        createdAt: moderationAppeals.createdAt,
+        updatedAt: moderationAppeals.updatedAt,
+        username: users.username,
+        displayName: users.displayName,
+        avatarUrl: users.avatarUrl,
+        email: users.email,
+        reviewerUsername: sql`r.username`,
+        reviewerName: sql`r."displayName"`,
+      })
+      .from(moderationAppeals)
+      .leftJoin(users, eq(moderationAppeals.userId, users.id))
+      .leftJoin(sql`users r`, sql`r.id = ${moderationAppeals.reviewerId}`)
+      .where(statusCondition)
+      .orderBy(
+        sql`CASE WHEN ${moderationAppeals.status} = 'pending' THEN 0 ELSE 1 END`,
+        desc(moderationAppeals.createdAt)
+      )
+      .limit(limit)
+      .offset(offset);
+
+    const totalCountRes = await db
+      .select({ count: count() })
+      .from(moderationAppeals)
+      .where(statusCondition);
+    const total = Number(totalCountRes[0]?.count || 0);
 
     const formatted = appeals.map((a) => {
       let reasons = [];
@@ -142,31 +148,33 @@ adminRouter.get('/moderation/appeals', optionalAuth, async (c) => {
 
       return {
         id: a.id,
-        logId: a.log_id,
-        userId: a.user_id,
-        ipAddress: a.ip_address,
-        imageUrl: a.image_url,
-        fileKey: a.file_key,
+        logId: a.logId,
+        userId: a.userId,
+        ipAddress: a.ipAddress,
+        imageUrl: a.imageUrl,
+        fileKey: a.fileKey,
         reasons,
-        appealReason: a.appeal_reason,
+        appealReason: a.appealReason,
         status: a.status,
-        reviewerId: a.reviewer_id,
-        reviewerNote: a.reviewer_note,
-        reviewedAt: a.reviewed_at,
+        reviewerId: a.reviewerId,
+        reviewerNote: a.reviewerNote,
+        reviewedAt: a.reviewedAt,
         createdAt: a.createdAt,
         updatedAt: a.updatedAt,
-        user: {
-          id: a.user_id,
-          username: a.username || 'guest',
-          name: a.displayName || a.username || 'ผู้ใช้ทั่วไป',
-          avatarUrl: a.avatarUrl || null,
-          email: a.email || null,
-        },
-        reviewer: a.reviewer_id
+        user: a.userId
           ? {
-              id: a.reviewer_id,
-              username: a.reviewer_username,
-              name: a.reviewer_name || a.reviewer_username,
+              id: a.userId,
+              username: a.username,
+              displayName: a.displayName || a.username,
+              avatarUrl: a.avatarUrl,
+              email: a.email,
+            }
+          : null,
+        reviewer: a.reviewerId
+          ? {
+              id: a.reviewerId,
+              username: a.reviewerUsername,
+              displayName: a.reviewerName || a.reviewerUsername,
             }
           : null,
       };
@@ -174,18 +182,18 @@ adminRouter.get('/moderation/appeals', optionalAuth, async (c) => {
 
     return c.json({
       success: true,
-      data: formatted,
+      appeals: formatted,
       pagination: {
         page,
         limit,
         total,
-        hasMore: offset + appeals.length < total,
+        totalPages: Math.ceil(total / limit) || 1,
       },
     });
   } catch (err) {
-    console.error('Get moderation appeals error:', err);
+    console.error('Moderation appeals error:', err);
     return c.json(
-      { success: false, message: err.message || 'Failed to fetch appeals' },
+      { success: false, message: err.message || 'Failed to get appeals' },
       500
     );
   }
@@ -193,41 +201,53 @@ adminRouter.get('/moderation/appeals', optionalAuth, async (c) => {
 
 /**
  * 3. POST /moderation/appeals/:id/review
- * แอดมินตัดสินผลการอุทธรณ์ (Approve ปลดบล็อก / Reject ยืนยันว่าผิดกฎ)
+ * ดำเนินการอนุมัติ (approve) หรือปฏิเสธ (reject) คำอุทธรณ์
  */
 adminRouter.post('/moderation/appeals/:id/review', optionalAuth, async (c) => {
   try {
+    const rawSql = getDb(c);
+    await ensureModerationLogsTable(rawSql);
+
     const appealId = parseInt(c.req.param('id'), 10);
-    if (isNaN(appealId)) {
+    if (!appealId) {
       return c.json({ success: false, message: 'Invalid appeal ID' }, 400);
     }
 
-    const reviewer = c.get('user');
-    const sql = getDb(c);
     const body = await c.req.json();
-    const { action, reviewerNote } = body;
+    const { action, note } = body;
 
     if (!['approve', 'reject'].includes(action)) {
       return c.json(
-        { success: false, message: "action must be 'approve' or 'reject'" },
+        { success: false, message: 'Action must be either "approve" or "reject"' },
         400
       );
     }
 
-    const appeal = await reviewModerationAppeal(sql, {
+    const reviewer = c.get('user');
+    const reviewerId = reviewer?.id || null;
+
+    const result = await reviewModerationAppeal(rawSql, {
       appealId,
-      reviewerId: reviewer?.id || null,
       action,
-      reviewerNote: reviewerNote || null,
+      reviewerId,
+      reviewerNote: note || '',
+      r2Config: {
+        accountId: c.env.R2_ACCOUNT_ID,
+        accessKeyId: c.env.R2_ACCESS_KEY_ID,
+        secretAccessKey: c.env.R2_SECRET_ACCESS_KEY,
+        bucketName: c.env.R2_BUCKET_NAME || 'cats-coworker',
+        publicUrl: c.env.R2_PUBLIC_URL || 'https://pub-6d43351c06b34d6c91ecef3d7be6d4c3.r2.dev',
+      },
     });
+
+    if (!result.success) {
+      return c.json({ success: false, message: result.message }, 400);
+    }
 
     return c.json({
       success: true,
-      message:
-        action === 'approve'
-          ? 'อนุมัติคำร้องอุทธรณ์เรียบร้อยแล้ว (ปลดบล็อกสถานะความปลอดภัยให้ผู้ใช้)'
-          : 'ปฏิเสธคำร้องอุทธรณ์เรียบร้อยแล้ว (ยืนยันว่ารูปภาพละเมิดมาตรฐานชุมชน)',
-      appeal,
+      message: result.message,
+      appeal: result.appeal,
     });
   } catch (err) {
     console.error('Review appeal error:', err);
@@ -244,8 +264,9 @@ adminRouter.post('/moderation/appeals/:id/review', optionalAuth, async (c) => {
  */
 adminRouter.get('/moderation/logs', optionalAuth, async (c) => {
   try {
-    const sql = getDb(c);
-    await ensureModerationLogsTable(sql);
+    const rawSql = getDb(c);
+    await ensureModerationLogsTable(rawSql);
+    const db = getDrizzle(c);
 
     const page = Math.max(1, parseInt(c.req.query('page') || '1', 10));
     const limit = Math.min(100, Math.max(1, parseInt(c.req.query('limit') || '30', 10)));
@@ -254,59 +275,56 @@ adminRouter.get('/moderation/logs', optionalAuth, async (c) => {
     const action = c.req.query('action');
     const search = c.req.query('search')?.trim();
 
-    let logs = await sql`
-      SELECT 
-        l.id,
-        l.user_id,
-        l.ip_address,
-        l.file_key,
-        l.image_url,
-        l.reasons,
-        l.scores,
-        l.is_safe,
-        l.action_taken,
-        l."createdAt",
-        u.username,
-        u."displayName",
-        u."avatarUrl"
-      FROM moderation_logs l
-      LEFT JOIN users u ON l.user_id = u.id
-      WHERE 1=1
-        ${category ? sql`AND l.reasons::text ILIKE ${'%' + category + '%'}` : sql``}
-        ${action ? sql`AND l.action_taken = ${action}` : sql``}
-        ${
-          search
-            ? sql`AND (
-                l.ip_address ILIKE ${'%' + search + '%'}
-                OR l.image_url ILIKE ${'%' + search + '%'}
-                OR u.username ILIKE ${'%' + search + '%'}
-                OR u."displayName" ILIKE ${'%' + search + '%'}
-              )`
-            : sql``
-        }
-      ORDER BY l."createdAt" DESC
-      LIMIT ${limit} OFFSET ${offset}
-    `;
+    const conditions = [];
+    if (category) {
+      conditions.push(sql`${moderationLogs.reasons}::text ILIKE ${'%' + category + '%'}`);
+    }
+    if (action) {
+      conditions.push(eq(moderationLogs.actionTaken, action));
+    }
+    if (search) {
+      const searchPattern = `%${search}%`;
+      conditions.push(
+        or(
+          ilike(moderationLogs.ipAddress, searchPattern),
+          ilike(moderationLogs.imageUrl, searchPattern),
+          ilike(users.username, searchPattern),
+          ilike(users.displayName, searchPattern)
+        )
+      );
+    }
 
-    const totalCountRes = await sql`
-      SELECT COUNT(*)::int as count 
-      FROM moderation_logs l
-      LEFT JOIN users u ON l.user_id = u.id
-      WHERE 1=1
-        ${category ? sql`AND l.reasons::text ILIKE ${'%' + category + '%'}` : sql``}
-        ${action ? sql`AND l.action_taken = ${action}` : sql``}
-        ${
-          search
-            ? sql`AND (
-                l.ip_address ILIKE ${'%' + search + '%'}
-                OR l.image_url ILIKE ${'%' + search + '%'}
-                OR u.username ILIKE ${'%' + search + '%'}
-                OR u."displayName" ILIKE ${'%' + search + '%'}
-              )`
-            : sql``
-        }
-    `;
-    const total = totalCountRes[0]?.count || 0;
+    const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+
+    const logs = await db
+      .select({
+        id: moderationLogs.id,
+        userId: moderationLogs.userId,
+        ipAddress: moderationLogs.ipAddress,
+        fileKey: moderationLogs.fileKey,
+        imageUrl: moderationLogs.imageUrl,
+        reasons: moderationLogs.reasons,
+        scores: moderationLogs.scores,
+        isSafe: moderationLogs.isSafe,
+        actionTaken: moderationLogs.actionTaken,
+        createdAt: moderationLogs.createdAt,
+        username: users.username,
+        displayName: users.displayName,
+        avatarUrl: users.avatarUrl,
+      })
+      .from(moderationLogs)
+      .leftJoin(users, eq(moderationLogs.userId, users.id))
+      .where(whereClause)
+      .orderBy(desc(moderationLogs.createdAt))
+      .limit(limit)
+      .offset(offset);
+
+    const totalCountRes = await db
+      .select({ count: count() })
+      .from(moderationLogs)
+      .leftJoin(users, eq(moderationLogs.userId, users.id))
+      .where(whereClause);
+    const total = Number(totalCountRes[0]?.count || 0);
 
     const formatted = logs.map((l) => {
       let reasons = [];
@@ -320,7 +338,7 @@ adminRouter.get('/moderation/logs', optionalAuth, async (c) => {
       }
 
       let scores = {};
-      if (typeof l.scores === 'object' && l.scores !== null) scores = l.scores;
+      if (l.scores && typeof l.scores === 'object') scores = l.scores;
       else if (typeof l.scores === 'string') {
         try {
           scores = JSON.parse(l.scores);
@@ -329,49 +347,43 @@ adminRouter.get('/moderation/logs', optionalAuth, async (c) => {
 
       return {
         id: l.id,
-        userId: l.user_id,
-        ipAddress: l.ip_address,
-        fileKey: l.file_key,
-        imageUrl: l.image_url,
+        userId: l.userId,
+        ipAddress: l.ipAddress,
+        fileKey: l.fileKey,
+        imageUrl: l.imageUrl,
         reasons,
         scores,
-        isSafe: l.is_safe,
-        actionTaken: l.action_taken,
+        isSafe: l.isSafe,
+        actionTaken: l.actionTaken,
         createdAt: l.createdAt,
-        user: l.user_id
+        user: l.userId
           ? {
-              id: l.user_id,
-              username: l.username || 'user',
-              name: l.displayName || l.username || 'User',
-              avatarUrl: l.avatarUrl || null,
+              id: l.userId,
+              username: l.username,
+              displayName: l.displayName || l.username,
+              avatarUrl: l.avatarUrl,
             }
-          : {
-              id: null,
-              username: 'guest',
-              name: 'ผู้เยี่ยมชม (Guest)',
-              avatarUrl: null,
-            },
+          : null,
       };
     });
 
     return c.json({
       success: true,
-      data: formatted,
+      logs: formatted,
       pagination: {
         page,
         limit,
         total,
-        hasMore: offset + logs.length < total,
+        totalPages: Math.ceil(total / limit) || 1,
       },
     });
   } catch (err) {
-    console.error('Get moderation logs error:', err);
+    console.error('Moderation logs error:', err);
     return c.json(
-      { success: false, message: err.message || 'Failed to fetch moderation logs' },
+      { success: false, message: err.message || 'Failed to get moderation logs' },
       500
     );
   }
 });
 
 export default adminRouter;
-

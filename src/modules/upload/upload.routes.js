@@ -2,7 +2,9 @@ import { Hono } from 'hono';
 import { PutObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { getR2Client, getR2Config } from '../../config/r2';
-import { getDb } from '../../config/db';
+import { getDb, getDrizzle } from '../../config/db.js';
+import { media, moderationAppeals } from '../../db/schema.js';
+import { eq, or, desc } from 'drizzle-orm';
 import { optionalAuth, requireAuth } from '../../middleware/auth';
 import {
   checkImageUrl,
@@ -285,36 +287,23 @@ upload.post('/complete', optionalAuth, async (c) => {
       );
     }
 
-    const inserted = await sql`
-      INSERT INTO media (
-        "fileKey",
+    const db = getDrizzle(c);
+    const inserted = await db
+      .insert(media)
+      .values({
+        fileKey,
         url,
         type,
-        "mimeType",
-        "originalName",
-        size,
-        width,
-        height,
-        "entityType",
-        "entityId",
-        uploaded_by,
-        "createdAt"
-      ) VALUES (
-        ${fileKey},
-        ${url},
-        ${type},
-        ${mimeType || null},
-        ${originalName || null},
-        ${size || null},
-        ${width || null},
-        ${height || null},
-        ${entityType},
-        ${entityId || null},
-        ${user?.id || null},
-        NOW()
-      )
-      RETURNING *
-    `;
+        mimeType: mimeType || null,
+        originalName: originalName || null,
+        size: size ? Number(size) : null,
+        width: width || null,
+        height: height || null,
+        entityType,
+        entityId: entityId ? Number(entityId) : null,
+        uploadedBy: user?.id || null,
+      })
+      .returning();
 
     return c.json({
       success: true,
@@ -442,28 +431,19 @@ upload.post('/direct', requireAuth, async (c) => {
     const fullPublicUrl = `${publicUrl}/${fileKey}`;
     const type = file.type.startsWith('video/') ? 'video' : 'image';
 
-    const inserted = await sql`
-      INSERT INTO media (
-        "fileKey",
-        url,
+    const db = getDrizzle(c);
+    const inserted = await db
+      .insert(media)
+      .values({
+        fileKey,
+        url: fullPublicUrl,
         type,
-        "mimeType",
-        "originalName",
-        size,
-        uploaded_by,
-        "createdAt"
-      ) VALUES (
-        ${fileKey},
-        ${fullPublicUrl},
-        ${type},
-        ${file.type},
-        ${file.name},
-        ${file.size},
-        ${user.id},
-        NOW()
-      )
-      RETURNING *
-    `;
+        mimeType: file.type,
+        originalName: file.name,
+        size: file.size,
+        uploadedBy: user.id,
+      })
+      .returning();
 
     return c.json({
       success: true,
@@ -572,22 +552,27 @@ upload.post('/appeal', optionalAuth, async (c) => {
 upload.get('/my-appeals', optionalAuth, async (c) => {
   try {
     const user = c.get('user');
-    const sql = getDb(c);
+    const db = getDrizzle(c);
     const ipAddress = getClientIp(c);
 
     if (!user?.id && (!ipAddress || ipAddress === 'unknown')) {
       return c.json({ success: true, appeals: [] });
     }
 
-    const appeals = await sql`
-      SELECT *
-      FROM moderation_appeals
-      WHERE 
-        (${user?.id ? sql`user_id = ${user.id}` : sql`false`})
-        OR (${ipAddress && ipAddress !== 'unknown' ? sql`ip_address = ${ipAddress}` : sql`false`})
-      ORDER BY "createdAt" DESC
-      LIMIT 20
-    `;
+    const conditions = [];
+    if (user?.id) {
+      conditions.push(eq(moderationAppeals.userId, user.id));
+    }
+    if (ipAddress && ipAddress !== 'unknown') {
+      conditions.push(eq(moderationAppeals.ipAddress, ipAddress));
+    }
+
+    const appeals = await db
+      .select()
+      .from(moderationAppeals)
+      .where(or(...conditions))
+      .orderBy(desc(moderationAppeals.createdAt))
+      .limit(20);
 
     return c.json({
       success: true,

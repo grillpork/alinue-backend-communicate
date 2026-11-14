@@ -1,29 +1,25 @@
 import { Hono } from 'hono';
-import { getDb } from '../../config/db';
-import { requireAuth, optionalAuth } from '../../middleware/auth';
+import { getDrizzle, getDb } from '../../config/db.js';
+import { showcases, showcaseLikes, users, searchLogs } from '../../db/schema.js';
+import { requireAuth, optionalAuth } from '../../middleware/auth.js';
 import {
   checkImageUrl,
   deleteFromR2,
   checkUserTimeoutStatus,
   recordModerationViolation,
   getClientIp,
-} from '../../utils/moderation';
-import { createNotification } from '../notification/notification.service';
+} from '../../utils/moderation.js';
+import { createNotification } from '../notification/notification.service.js';
+import { eq, and, or, ilike, sql, desc } from 'drizzle-orm';
 
 const showcaseRouter = new Hono();
 
 /**
  * 1. GET /api/showcases - ดึงรายการผลงาน Showcase ทั้งหมด
- * รองรับ Query Params:
- * - search: ค้นหาจากชื่อผลงาน (title), คำอธิบาย (description), หรือชื่อครีเอเตอร์
- * - username: ดึงเฉพาะผลงานของ user คนนี้
- * - user_id: ดึงเฉพาะผลงานของ user_id นี้
- * - page: หน้าปัจจุบัน (default: 1)
- * - limit: จำนวนต่อหน้า (default: 20)
  */
 showcaseRouter.get('/', optionalAuth, async (c) => {
   try {
-    const sql = getDb(c);
+    const db = getDrizzle(c);
     const currentUser = c.get('user');
 
     const search = c.req.query('search')?.trim() || '';
@@ -35,9 +31,12 @@ showcaseRouter.get('/', optionalAuth, async (c) => {
 
     let targetUserId = userIdParam ? parseInt(userIdParam, 10) : null;
     if (!targetUserId && username) {
-      const uRes = await sql`
-        SELECT id FROM users WHERE LOWER(username) = ${username} LIMIT 1
-      `;
+      const uRes = await db
+        .select({ id: users.id })
+        .from(users)
+        .where(sql`LOWER(${users.username}) = ${username}`)
+        .limit(1);
+
       if (uRes.length > 0) {
         targetUserId = uRes[0].id;
       } else {
@@ -49,53 +48,90 @@ showcaseRouter.get('/', optionalAuth, async (c) => {
       }
     }
 
-    const showcases = await sql`
-      SELECT 
-        s.*,
-        u.username as author_username,
-        u."displayName" as author_name,
-        u."avatarUrl" as author_avatar,
-        ${
-          currentUser?.id
-            ? sql`EXISTS(SELECT 1 FROM showcase_likes sl WHERE sl.showcase_id = s.id AND sl.user_id = ${currentUser.id}) as is_liked`
-            : sql`false as is_liked`
-        }
-      FROM showcases s
-      LEFT JOIN users u ON s.user_id = u.id
-      WHERE s.is_published = true
-        ${targetUserId ? sql`AND s.user_id = ${targetUserId}` : sql``}
-        ${
-          search
-            ? sql`AND (s.title ILIKE ${'%' + search + '%'} OR s.description ILIKE ${'%' + search + '%'} OR u."displayName" ILIKE ${'%' + search + '%'} OR u.username ILIKE ${'%' + search + '%'})`
-            : sql``
-        }
-      ORDER BY s."createdAt" DESC
-      LIMIT ${limit + 1} OFFSET ${offset}
-    `;
+    const conditions = [eq(showcases.isPublished, true)];
+    if (targetUserId) {
+      conditions.push(eq(showcases.userId, targetUserId));
+    }
+    if (search) {
+      const searchPattern = `%${search}%`;
+      conditions.push(
+        or(
+          ilike(showcases.title, searchPattern),
+          ilike(showcases.description, searchPattern),
+          ilike(users.displayName, searchPattern),
+          ilike(users.username, searchPattern)
+        )
+      );
+    }
 
-    const hasMore = showcases.length > limit;
-    const items = hasMore ? showcases.slice(0, limit) : showcases;
+    const items = await db
+      .select({
+        id: showcases.id,
+        userId: showcases.userId,
+        title: showcases.title,
+        description: showcases.description,
+        mediaUrls: showcases.mediaUrls,
+        mediaType: showcases.mediaType,
+        coverUrl: showcases.coverUrl,
+        tags: showcases.tags,
+        likesCount: showcases.likesCount,
+        viewsCount: showcases.viewsCount,
+        createdAt: showcases.createdAt,
+        updatedAt: showcases.updatedAt,
+        authorUsername: users.username,
+        authorName: users.displayName,
+        authorAvatar: users.avatarUrl,
+        isLiked: currentUser?.id
+          ? sql`EXISTS(SELECT 1 FROM showcase_likes sl WHERE sl.showcase_id = ${showcases.id} AND sl.user_id = ${currentUser.id})`
+          : sql`false`,
+      })
+      .from(showcases)
+      .leftJoin(users, eq(showcases.userId, users.id))
+      .where(and(...conditions))
+      .orderBy(desc(showcases.createdAt))
+      .limit(limit + 1)
+      .offset(offset);
 
-    const formatted = items.map((s) => ({
+    const hasMore = items.length > limit;
+    const resultItems = hasMore ? items.slice(0, limit) : items;
+
+    const formatted = resultItems.map((s) => ({
       id: s.id,
+      userId: s.userId,
       title: s.title,
       description: s.description || '',
-      mediaUrls: Array.isArray(s.media_urls) ? s.media_urls : [],
-      mediaType: s.media_type || 'image',
-      coverUrl: s.cover_url || (Array.isArray(s.media_urls) && s.media_urls[0]) || null,
+      mediaUrls: Array.isArray(s.mediaUrls) ? s.mediaUrls : [],
+      mediaType: s.mediaType || 'image',
+      coverUrl: s.coverUrl || (Array.isArray(s.mediaUrls) && s.mediaUrls[0]) || null,
       tags: Array.isArray(s.tags) ? s.tags : [],
-      likesCount: s.likes_count || 0,
-      viewsCount: s.views_count || 0,
-      isLiked: Boolean(s.is_liked),
+      likesCount: s.likesCount || 0,
+      viewsCount: s.viewsCount || 0,
+      isLiked: Boolean(s.isLiked),
       createdAt: s.createdAt,
       updatedAt: s.updatedAt,
       author: {
-        id: s.user_id,
-        name: s.author_name || s.author_username || 'Anonymous',
-        username: s.author_username || 'user',
-        avatar: s.author_avatar || null,
+        id: s.userId,
+        name: s.authorName || s.authorUsername || 'Anonymous',
+        username: s.authorUsername || 'user',
+        avatar: s.authorAvatar || null,
       },
     }));
+
+    // บันทึกประวัติการค้นหาถ้ามีการค้นหา showcase
+    if (search && search.trim()) {
+      try {
+        const ipAddress = getClientIp(c);
+        db.insert(searchLogs)
+          .values({
+            query: search.trim(),
+            userId: currentUser?.id || null,
+            searchType: 'showcases',
+            resultCount: formatted.length,
+            ipAddress,
+          })
+          .catch(() => {});
+      } catch {}
+    }
 
     return c.json({
       success: true,
@@ -113,7 +149,7 @@ showcaseRouter.get('/', optionalAuth, async (c) => {
 });
 
 /**
- * 2. GET /api/showcases/:id - ดูรายละเอียด Showcase ชิ้นเดียว
+ * 2. GET /api/showcases/:id - ดึงรายละเอียดผลงานเดี่ยว
  */
 showcaseRouter.get('/:id', optionalAuth, async (c) => {
   try {
@@ -122,28 +158,40 @@ showcaseRouter.get('/:id', optionalAuth, async (c) => {
       return c.json({ success: false, message: 'Invalid showcase ID' }, 400);
     }
 
-    const sql = getDb(c);
+    const db = getDrizzle(c);
     const currentUser = c.get('user');
 
     // เพิ่ม views count
-    await sql`UPDATE showcases SET views_count = views_count + 1 WHERE id = ${showcaseId}`;
+    await db
+      .update(showcases)
+      .set({ viewsCount: sql`${showcases.viewsCount} + 1` })
+      .where(eq(showcases.id, showcaseId));
 
-    const rows = await sql`
-      SELECT 
-        s.*,
-        u.username as author_username,
-        u."displayName" as author_name,
-        u."avatarUrl" as author_avatar,
-        ${
-          currentUser?.id
-            ? sql`EXISTS(SELECT 1 FROM showcase_likes sl WHERE sl.showcase_id = s.id AND sl.user_id = ${currentUser.id}) as is_liked`
-            : sql`false as is_liked`
-        }
-      FROM showcases s
-      LEFT JOIN users u ON s.user_id = u.id
-      WHERE s.id = ${showcaseId}
-      LIMIT 1
-    `;
+    const rows = await db
+      .select({
+        id: showcases.id,
+        userId: showcases.userId,
+        title: showcases.title,
+        description: showcases.description,
+        mediaUrls: showcases.mediaUrls,
+        mediaType: showcases.mediaType,
+        coverUrl: showcases.coverUrl,
+        tags: showcases.tags,
+        likesCount: showcases.likesCount,
+        viewsCount: showcases.viewsCount,
+        createdAt: showcases.createdAt,
+        updatedAt: showcases.updatedAt,
+        authorUsername: users.username,
+        authorName: users.displayName,
+        authorAvatar: users.avatarUrl,
+        isLiked: currentUser?.id
+          ? sql`EXISTS(SELECT 1 FROM showcase_likes sl WHERE sl.showcase_id = ${showcases.id} AND sl.user_id = ${currentUser.id})`
+          : sql`false`,
+      })
+      .from(showcases)
+      .leftJoin(users, eq(showcases.userId, users.id))
+      .where(eq(showcases.id, showcaseId))
+      .limit(1);
 
     if (rows.length === 0) {
       return c.json({ success: false, message: 'Showcase not found' }, 404);
@@ -154,22 +202,23 @@ showcaseRouter.get('/:id', optionalAuth, async (c) => {
       success: true,
       showcase: {
         id: s.id,
+        userId: s.userId,
         title: s.title,
         description: s.description || '',
-        mediaUrls: Array.isArray(s.media_urls) ? s.media_urls : [],
-        mediaType: s.media_type || 'image',
-        coverUrl: s.cover_url || (Array.isArray(s.media_urls) && s.media_urls[0]) || null,
+        mediaUrls: Array.isArray(s.mediaUrls) ? s.mediaUrls : [],
+        mediaType: s.mediaType || 'image',
+        coverUrl: s.coverUrl || (Array.isArray(s.mediaUrls) && s.mediaUrls[0]) || null,
         tags: Array.isArray(s.tags) ? s.tags : [],
-        likesCount: s.likes_count || 0,
-        viewsCount: s.views_count || 0,
-        isLiked: Boolean(s.is_liked),
+        likesCount: s.likesCount || 0,
+        viewsCount: s.viewsCount || 0,
+        isLiked: Boolean(s.isLiked),
         createdAt: s.createdAt,
         updatedAt: s.updatedAt,
         author: {
-          id: s.user_id,
-          name: s.author_name || s.author_username || 'Anonymous',
-          username: s.author_username || 'user',
-          avatar: s.author_avatar || null,
+          id: s.userId,
+          name: s.authorName || s.authorUsername || 'Anonymous',
+          username: s.authorUsername || 'user',
+          avatar: s.authorAvatar || null,
         },
       },
     });
@@ -181,17 +230,17 @@ showcaseRouter.get('/:id', optionalAuth, async (c) => {
 
 /**
  * 3. POST /api/showcases - สร้าง Showcase ผลงานใหม่
- * Body: { title, description, mediaUrls, mediaType, coverUrl, tags }
  */
 showcaseRouter.post('/', requireAuth, async (c) => {
   try {
     const user = c.get('user');
     const body = await c.req.json();
-    const sql = getDb(c);
+    const rawSql = getDb(c);
+    const db = getDrizzle(c);
     const ipAddress = getClientIp(c);
 
     // Tier 3: ตรวจสอบสถานะ Timeout / Rate Limit ก่อนสร้าง Showcase
-    const timeoutStatus = await checkUserTimeoutStatus(sql, {
+    const timeoutStatus = await checkUserTimeoutStatus(rawSql, {
       userId: user.id,
       ipAddress,
     });
@@ -200,103 +249,89 @@ showcaseRouter.post('/', requireAuth, async (c) => {
         {
           success: false,
           isTimedOut: true,
-          remainingMinutes: timeoutStatus.remainingMinutes,
+          action: 'timeout',
           message: timeoutStatus.message,
+          retryAfterSeconds: timeoutStatus.retryAfterSeconds,
+          timeoutExpiresAt: timeoutStatus.timeoutExpiresAt,
         },
         429
       );
     }
 
-    const title = body.title?.trim();
-    const description = body.description?.trim() || null;
-    
-    // รองรับทั้ง camelCase และ snake_case (mediaUrls / media_urls)
-    const rawMediaUrls = body.mediaUrls || body.media_urls || [];
-    const mediaType = body.mediaType || body.media_type;
-    const coverUrl = body.coverUrl || body.cover_url;
-    const rawTags = body.tags || [];
+    const {
+      title,
+      description = '',
+      mediaUrls = [],
+      mediaType = 'image',
+      coverUrl = null,
+      tags: rawTags = [],
+    } = body;
 
-    if (!title) {
-      return c.json({ success: false, message: 'Title is required for showcase' }, 400);
+    if (!title || !title.trim()) {
+      return c.json({ success: false, message: 'Title is required' }, 400);
     }
 
-    let finalMediaUrls = Array.isArray(rawMediaUrls)
-      ? rawMediaUrls
-      : typeof rawMediaUrls === 'string'
-      ? [rawMediaUrls]
+    const finalMediaUrls = Array.isArray(mediaUrls)
+      ? mediaUrls.filter((url) => typeof url === 'string' && url.trim().length > 0)
       : [];
 
-    if (finalMediaUrls.length === 0 && coverUrl) {
-      finalMediaUrls = [coverUrl];
+    if (finalMediaUrls.length === 0 && !coverUrl) {
+      return c.json({ success: false, message: 'At least one media URL or cover is required' }, 400);
     }
 
-    if (finalMediaUrls.length === 0) {
-      return c.json(
-        { success: false, message: 'กรุณาอัปโหลดรูปภาพผลงานอย่างน้อย 1 รูป' },
-        400
-      );
-    }
+    // ตรวจสอบความปลอดภัยของรูปภาพทั้งหมดก่อนบันทึก
+    const urlsToCheck = Array.from(new Set([...finalMediaUrls, coverUrl].filter(Boolean)));
+    const r2Config = {
+      accountId: c.env.R2_ACCOUNT_ID,
+      accessKeyId: c.env.R2_ACCESS_KEY_ID,
+      secretAccessKey: c.env.R2_SECRET_ACCESS_KEY,
+      bucketName: c.env.R2_BUCKET_NAME || 'cats-coworker',
+      publicUrl: c.env.R2_PUBLIC_URL || 'https://pub-6d43351c06b34d6c91ecef3d7be6d4c3.r2.dev',
+    };
 
-    // ตรวจสอบว่าต้องไม่ใช่ GIF หรือ Video
-    for (const imgUrl of finalMediaUrls) {
-      if (typeof imgUrl === 'string') {
-        const lower = imgUrl.toLowerCase();
-        if (
-          lower.includes('.gif') ||
-          lower.includes('.mp4') ||
-          lower.includes('.webm') ||
-          lower.includes('.mov')
-        ) {
-          return c.json(
-            {
-              success: false,
-              message:
-                'ระบบรองรับเฉพาะรูปภาพนิ่ง (JPG, PNG, WebP) เท่านั้น ไม่อนุญาต GIF หรือวิดีโอ',
-            },
-            400
-          );
-        }
+    for (const imgUrl of urlsToCheck) {
+      const isOurR2Image = imgUrl.includes(r2Config.publicUrl) || imgUrl.includes('.r2.dev');
+      if (isOurR2Image) {
+        const check = await checkImageUrl(imgUrl, c.env);
+        if (!check.isSafe) {
+          // ลบไฟล์ที่ไม่ปลอดภัยออกจาก R2 ทันที
+          const fileKey = imgUrl.replace(`${r2Config.publicUrl}/`, '').replace(/^https?:\/\/[^/]+\//, '');
+          if (fileKey) {
+            await deleteFromR2(fileKey, r2Config);
+          }
 
-        // ตรวจสอบความปลอดภัยของภาพผ่าน Sightengine (อนาจาร, อาวุธ, ความรุนแรง/เลือด)
-        if (lower.startsWith('http')) {
-          const check = await checkImageUrl(imgUrl, c.env);
-          if (!check.isSafe) {
-            // Tier 2: ลบภาพอันตรายออกจาก R2 ทันที
-            await deleteFromR2(c, imgUrl);
+          // บันทึกประวัติการละเมิด
+          const viol = await recordModerationViolation(rawSql, {
+            userId: user.id,
+            ipAddress,
+            fileKey,
+            imageUrl: imgUrl,
+            reasons: check.reasons,
+            scores: check.scores,
+          });
 
-            // Tier 3: บันทึก Audit Log
-            await recordModerationViolation(sql, {
-              userId: user.id,
-              ipAddress,
-              fileKey: null,
-              imageUrl: imgUrl,
-              reasons: check.reasons,
-              scores: check.scores,
-              actionTaken: 'rejected_and_deleted',
-            });
-
-            // Tier 3: ตรวจสอบว่าติดฟิลเตอร์เกิน 3 ครั้งใน 10 นาทีหรือยัง
-            const updatedTimeout = await checkUserTimeoutStatus(sql, {
-              userId: user.id,
-              ipAddress,
-            });
-
-            if (updatedTimeout.isTimedOut) {
-              return c.json(
-                {
-                  success: false,
-                  isTimedOut: true,
-                  remainingMinutes: updatedTimeout.remainingMinutes,
-                  message: updatedTimeout.message,
-                  reasons: check.reasons,
-                },
-                429
-              );
-            }
-
+          if (viol?.action === 'timeout') {
             return c.json(
               {
                 success: false,
+                isTimedOut: true,
+                action: 'timeout',
+                message: viol.message,
+                reasons: check.reasons,
+                scores: check.scores,
+                retryAfterSeconds: viol.retryAfterSeconds,
+                timeoutExpiresAt: viol.timeoutExpiresAt,
+              },
+              429
+            );
+          } else {
+            return c.json(
+              {
+                success: false,
+                isBlocked: true,
+                action: 'blocked',
+                logId: viol?.logRecord?.id || null,
+                imageUrl: imgUrl,
                 message: `ไม่สามารถบันทึกผลงานได้เนื่องจากรูปภาพไม่เหมาะสม: ${check.reasons.join(', ')}`,
                 reasons: check.reasons,
                 scores: check.scores,
@@ -312,60 +347,44 @@ showcaseRouter.post('/', requireAuth, async (c) => {
     const finalCoverUrl = coverUrl || finalMediaUrls[0] || null;
     const finalTags = Array.isArray(rawTags) ? rawTags : [];
 
-    const inserted = await sql`
-      INSERT INTO showcases (
-        user_id,
+    const inserted = await db
+      .insert(showcases)
+      .values({
+        userId: user.id,
         title,
         description,
-        media_urls,
-        media_type,
-        cover_url,
-        tags,
-        likes_count,
-        views_count,
-        is_published,
-        "createdAt",
-        "updatedAt"
-      ) VALUES (
-        ${user.id},
-        ${title},
-        ${description},
-        ${JSON.stringify(finalMediaUrls)}::jsonb,
-        ${finalMediaType},
-        ${finalCoverUrl},
-        ${JSON.stringify(finalTags)}::jsonb,
-        0,
-        0,
-        true,
-        NOW(),
-        NOW()
-      )
-      RETURNING *
-    `;
+        mediaUrls: finalMediaUrls,
+        mediaType: finalMediaType,
+        coverUrl: finalCoverUrl,
+        tags: finalTags,
+        likesCount: 0,
+        viewsCount: 0,
+        isPublished: true,
+      })
+      .returning();
 
     const s = inserted[0];
 
     return c.json(
       {
         success: true,
-        message: 'Showcase created successfully',
         showcase: {
           id: s.id,
           title: s.title,
           description: s.description || '',
-          mediaUrls: finalMediaUrls,
-          mediaType: s.media_type,
-          coverUrl: s.cover_url,
-          tags: finalTags,
-          likesCount: 0,
-          viewsCount: 0,
-          isLiked: false,
+          mediaUrls: Array.isArray(s.mediaUrls) ? s.mediaUrls : [],
+          mediaType: s.mediaType || 'image',
+          coverUrl: s.coverUrl,
+          tags: Array.isArray(s.tags) ? s.tags : [],
+          likesCount: s.likesCount || 0,
+          viewsCount: s.viewsCount || 0,
           createdAt: s.createdAt,
+          updatedAt: s.updatedAt,
           author: {
             id: user.id,
-            name: user.displayName || user.username,
+            name: user.displayName || user.username || 'You',
             username: user.username,
-            avatar: user.avatarUrl || null,
+            avatar: user.avatarUrl,
           },
         },
       },
@@ -373,7 +392,7 @@ showcaseRouter.post('/', requireAuth, async (c) => {
     );
   } catch (err) {
     console.error('Create showcase error:', err);
-    return c.json({ success: false, message: err.message || 'Failed to create showcase' }, 500);
+    return c.json({ success: false, message: 'Failed to create showcase' }, 500);
   }
 });
 
@@ -388,43 +407,52 @@ showcaseRouter.post('/:id/like', requireAuth, async (c) => {
     }
 
     const user = c.get('user');
-    const sql = getDb(c);
+    const db = getDrizzle(c);
 
     // ตรวจสอบว่าเคยกด Like หรือยัง
-    const existing = await sql`
-      SELECT id FROM showcase_likes 
-      WHERE showcase_id = ${showcaseId} AND user_id = ${user.id}
-      LIMIT 1
-    `;
+    const existing = await db
+      .select({ id: showcaseLikes.id })
+      .from(showcaseLikes)
+      .where(and(eq(showcaseLikes.showcaseId, showcaseId), eq(showcaseLikes.userId, user.id)))
+      .limit(1);
 
     let isLiked = false;
     if (existing.length > 0) {
       // ยกเลิก Like
-      await sql`DELETE FROM showcase_likes WHERE id = ${existing[0].id}`;
-      await sql`
-        UPDATE showcases 
-        SET likes_count = GREATEST(0, likes_count - 1), "updatedAt" = NOW() 
-        WHERE id = ${showcaseId}
-      `;
+      await db.delete(showcaseLikes).where(eq(showcaseLikes.id, existing[0].id));
+      await db
+        .update(showcases)
+        .set({
+          likesCount: sql`GREATEST(0, ${showcases.likesCount} - 1)`,
+          updatedAt: sql`NOW()`,
+        })
+        .where(eq(showcases.id, showcaseId));
       isLiked = false;
     } else {
       // กด Like
-      await sql`
-        INSERT INTO showcase_likes (showcase_id, user_id, "createdAt")
-        VALUES (${showcaseId}, ${user.id}, NOW())
-      `;
-      await sql`
-        UPDATE showcases 
-        SET likes_count = likes_count + 1, "updatedAt" = NOW() 
-        WHERE id = ${showcaseId}
-      `;
+      await db.insert(showcaseLikes).values({
+        showcaseId,
+        userId: user.id,
+      });
+      await db
+        .update(showcases)
+        .set({
+          likesCount: sql`${showcases.likesCount} + 1`,
+          updatedAt: sql`NOW()`,
+        })
+        .where(eq(showcases.id, showcaseId));
       isLiked = true;
 
       // สร้างการแจ้งเตือน Like Showcase
-      const scOwnerRes = await sql`SELECT user_id, title FROM showcases WHERE id = ${showcaseId} LIMIT 1`;
+      const scOwnerRes = await db
+        .select({ userId: showcases.userId, title: showcases.title })
+        .from(showcases)
+        .where(eq(showcases.id, showcaseId))
+        .limit(1);
+
       if (scOwnerRes.length > 0) {
-        await createNotification(sql, {
-          userId: scOwnerRes[0].user_id,
+        await createNotification(db, {
+          userId: scOwnerRes[0].userId,
           actorId: user.id,
           type: 'showcase_like',
           entityId: showcaseId,
@@ -435,18 +463,119 @@ showcaseRouter.post('/:id/like', requireAuth, async (c) => {
     }
 
     // ดึงจำนวน Like ล่าสุด
-    const current = await sql`
-      SELECT likes_count FROM showcases WHERE id = ${showcaseId} LIMIT 1
-    `;
+    const current = await db
+      .select({ likesCount: showcases.likesCount })
+      .from(showcases)
+      .where(eq(showcases.id, showcaseId))
+      .limit(1);
 
     return c.json({
       success: true,
       liked: isLiked,
-      likesCount: current[0]?.likes_count || 0,
+      likesCount: current[0]?.likesCount || 0,
     });
   } catch (err) {
     console.error('Toggle showcase like error:', err);
     return c.json({ success: false, message: 'Failed to toggle like' }, 500);
+  }
+});
+
+/**
+ * 4.1 PUT /api/showcases/:id - แก้ไขผลงาน Showcase
+ */
+showcaseRouter.put('/:id', requireAuth, async (c) => {
+  try {
+    const showcaseId = parseInt(c.req.param('id'), 10);
+    if (isNaN(showcaseId)) {
+      return c.json({ success: false, message: 'Invalid showcase ID' }, 400);
+    }
+
+    const user = c.get('user');
+    const db = getDrizzle(c);
+
+    // ตรวจสอบว่าเป็นเจ้าของผลงานหรือไม่
+    const existing = await db
+      .select()
+      .from(showcases)
+      .where(eq(showcases.id, showcaseId))
+      .limit(1);
+
+    if (existing.length === 0) {
+      return c.json({ success: false, message: 'Showcase not found' }, 404);
+    }
+
+    if (existing[0].userId !== user.id) {
+      return c.json({ success: false, message: 'Forbidden: You do not own this showcase' }, 403);
+    }
+
+    const body = await c.req.json();
+    const {
+      title,
+      description,
+      mediaUrls,
+      media_urls,
+      mediaType,
+      media_type,
+      coverUrl,
+      cover_url,
+      tags,
+    } = body;
+
+    const updateData = {
+      updatedAt: sql`NOW()`,
+    };
+
+    if (title !== undefined && title.trim()) {
+      updateData.title = title.trim();
+    }
+    if (description !== undefined) {
+      updateData.description = description ? description.trim() : null;
+    }
+    const finalMediaUrls = mediaUrls || media_urls;
+    if (finalMediaUrls !== undefined && Array.isArray(finalMediaUrls)) {
+      updateData.mediaUrls = finalMediaUrls;
+    }
+    const finalMediaType = mediaType || media_type;
+    if (finalMediaType !== undefined) {
+      updateData.mediaType = finalMediaType;
+    }
+    const finalCoverUrl = coverUrl !== undefined ? coverUrl : cover_url;
+    if (finalCoverUrl !== undefined) {
+      updateData.coverUrl = finalCoverUrl;
+    }
+    if (tags !== undefined && Array.isArray(tags)) {
+      updateData.tags = tags.map((t) => String(t).trim().replace(/^#/, '')).filter(Boolean);
+    }
+
+    const updated = await db
+      .update(showcases)
+      .set(updateData)
+      .where(eq(showcases.id, showcaseId))
+      .returning();
+
+    const s = updated[0];
+
+    return c.json({
+      success: true,
+      message: 'Showcase updated successfully',
+      showcase: {
+        id: s.id,
+        userId: s.userId,
+        title: s.title,
+        description: s.description || '',
+        mediaUrls: Array.isArray(s.mediaUrls) ? s.mediaUrls : [],
+        mediaType: s.mediaType || 'image',
+        coverUrl: s.coverUrl,
+        tags: Array.isArray(s.tags) ? s.tags : [],
+        likesCount: s.likesCount || 0,
+        viewsCount: s.viewsCount || 0,
+        createdAt: s.createdAt,
+        updatedAt: s.updatedAt,
+      },
+    });
+  } catch (err) {
+    console.error('Update showcase error:', err);
+    return c.json({ success: false, message: 'Failed to update showcase' }, 500);
   }
 });
 
@@ -461,22 +590,24 @@ showcaseRouter.delete('/:id', requireAuth, async (c) => {
     }
 
     const user = c.get('user');
-    const sql = getDb(c);
+    const db = getDrizzle(c);
 
     // ตรวจสอบว่าเป็นเจ้าของผลงานหรือไม่
-    const existing = await sql`
-      SELECT user_id FROM showcases WHERE id = ${showcaseId} LIMIT 1
-    `;
+    const existing = await db
+      .select({ userId: showcases.userId })
+      .from(showcases)
+      .where(eq(showcases.id, showcaseId))
+      .limit(1);
 
     if (existing.length === 0) {
       return c.json({ success: false, message: 'Showcase not found' }, 404);
     }
 
-    if (existing[0].user_id !== user.id) {
+    if (existing[0].userId !== user.id) {
       return c.json({ success: false, message: 'Forbidden: You do not own this showcase' }, 403);
     }
 
-    await sql`DELETE FROM showcases WHERE id = ${showcaseId}`;
+    await db.delete(showcases).where(eq(showcases.id, showcaseId));
 
     return c.json({ success: true, message: 'Showcase deleted successfully' });
   } catch (err) {
@@ -486,4 +617,3 @@ showcaseRouter.delete('/:id', requireAuth, async (c) => {
 });
 
 export default showcaseRouter;
-

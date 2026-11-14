@@ -1,6 +1,8 @@
 import { getCookie } from 'hono/cookie';
 import { verify } from 'hono/jwt';
-import { getDb } from '../config/db';
+import { getDrizzle, getDb } from '../config/db.js';
+import { sessions, users } from '../db/schema.js';
+import { eq, and, gt } from 'drizzle-orm';
 
 export function getJwtSecret(c) {
   const secret =
@@ -35,29 +37,29 @@ export async function getSessionUser(c) {
   if (!token) return null;
 
   try {
-    const sql = getDb(c);
+    const db = getDrizzle(c);
 
     // 1. ตรวจสอบกับ sessions table ในฐานข้อมูล
-    const rows = await sql`
-      SELECT 
-        s.id AS "sessionId",
-        s.token AS "sessionToken",
-        s."expiresAt",
-        u.id,
-        u.email,
-        u.username,
-        u."displayName",
-        u."avatarUrl",
-        u.bio,
-        u.location,
-        u.banner,
-        u.website,
-        u."isBanned"
-      FROM sessions s
-      JOIN users u ON s.user_id = u.id
-      WHERE s.token = ${token} AND s."expiresAt" > NOW()
-      LIMIT 1
-    `;
+    const rows = await db
+      .select({
+        sessionId: sessions.id,
+        sessionToken: sessions.token,
+        expiresAt: sessions.expiresAt,
+        id: users.id,
+        email: users.email,
+        username: users.username,
+        displayName: users.displayName,
+        avatarUrl: users.avatarUrl,
+        bio: users.bio,
+        location: users.location,
+        banner: users.banner,
+        website: users.website,
+        isBanned: users.isBanned,
+      })
+      .from(sessions)
+      .innerJoin(users, eq(sessions.userId, users.id))
+      .where(and(eq(sessions.token, token), gt(sessions.expiresAt, new Date().toISOString())))
+      .limit(1);
 
     if (rows && rows.length > 0) {
       const user = rows[0];
@@ -70,12 +72,22 @@ export async function getSessionUser(c) {
       const secret = getJwtSecret(c);
       const payload = await verify(token, secret, 'HS256');
       if (payload && payload.id) {
-        const uRows = await sql`
-          SELECT id, email, username, "displayName", "avatarUrl", bio, location, banner, website, "isBanned"
-          FROM users
-          WHERE id = ${payload.id}
-          LIMIT 1
-        `;
+        const uRows = await db
+          .select({
+            id: users.id,
+            email: users.email,
+            username: users.username,
+            displayName: users.displayName,
+            avatarUrl: users.avatarUrl,
+            bio: users.bio,
+            location: users.location,
+            banner: users.banner,
+            website: users.website,
+            isBanned: users.isBanned,
+          })
+          .from(users)
+          .where(eq(users.id, payload.id))
+          .limit(1);
         if (uRows.length > 0 && !uRows[0].isBanned) {
           return uRows[0];
         }
@@ -92,7 +104,7 @@ export async function getSessionUser(c) {
 /**
  * สร้าง Session ใหม่ลงตาราง sessions ในฐานข้อมูล
  */
-export async function createDbSession(sql, userId, c) {
+export async function createDbSession(dbOrSql, userId, c) {
   // สุ่ม Session Token ความยาว 64 ตัวอักษร
   const tokenBytes = new Uint8Array(32);
   crypto.getRandomValues(tokenBytes);
@@ -109,27 +121,16 @@ export async function createDbSession(sql, userId, c) {
     '127.0.0.1';
   const userAgent = c?.req?.header('user-agent') || '';
 
-  await sql`
-    INSERT INTO sessions (
-      id,
-      user_id,
-      token,
-      "expiresAt",
-      "ipAddress",
-      "userAgent",
-      "createdAt",
-      "updatedAt"
-    ) VALUES (
-      ${sessionId},
-      ${userId},
-      ${sessionToken},
-      ${expiresAt},
-      ${ipAddress},
-      ${userAgent},
-      NOW(),
-      NOW()
-    )
-  `;
+  const db = dbOrSql?.insert ? dbOrSql : (dbOrSql?.db || getDrizzle(c));
+
+  await db.insert(sessions).values({
+    id: sessionId,
+    userId,
+    token: sessionToken,
+    expiresAt,
+    ipAddress,
+    userAgent,
+  });
 
   return {
     sessionId,
@@ -162,4 +163,3 @@ export async function optionalAuth(c, next) {
   c.set('user', user || null);
   await next();
 }
-
