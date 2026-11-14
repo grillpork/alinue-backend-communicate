@@ -48,7 +48,7 @@ userRouter.get('/suggested', optionalAuth, async (c) => {
     });
   } catch (err) {
     console.error('Get suggested creators error:', err);
-    return c.json({ success: false, message: 'Server error' }, 500);
+    return c.json({ success: false, message: 'Server error', error: err?.message }, 500);
   }
 });
 

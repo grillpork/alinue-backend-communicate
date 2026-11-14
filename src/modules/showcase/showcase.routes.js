@@ -144,7 +144,7 @@ showcaseRouter.get('/', optionalAuth, async (c) => {
     });
   } catch (err) {
     console.error('Get showcases error:', err);
-    return c.json({ success: false, message: 'Failed to fetch showcases' }, 500);
+    return c.json({ success: false, message: 'Failed to fetch showcases', error: err?.message }, 500);
   }
 });
 

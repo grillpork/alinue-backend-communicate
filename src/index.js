@@ -80,6 +80,11 @@ app.get('/', (c) => {
 
 app.get('/health', async (c) => {
   try {
+    const rawUrl = c?.env?.DATABASE_URL || process.env.DATABASE_URL;
+    let dbHost = 'none';
+    try {
+      if (rawUrl) dbHost = new URL(rawUrl).host;
+    } catch {}
     const sql = getDb(c);
     const start = Date.now();
     await sql`SELECT 1`;
@@ -87,6 +92,7 @@ app.get('/health', async (c) => {
     return c.json({
       status: 'healthy',
       database: 'connected',
+      dbHost,
       latency: `${latency}ms`,
       uptime: process.uptime ? process.uptime() : undefined,
     });
