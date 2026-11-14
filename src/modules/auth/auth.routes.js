@@ -1,12 +1,14 @@
 import { Hono } from "hono";
 import { setCookie, deleteCookie } from "hono/cookie";
 import bcrypt from "bcryptjs";
-import { getDb } from "../../config/db";
+import { getDrizzle } from "../../config/db.js";
+import { users, sessions, accounts } from "../../db/schema.js";
+import { eq, or, sql } from "drizzle-orm";
 import {
   requireAuth,
   createDbSession,
   extractToken,
-} from "../../middleware/auth";
+} from "../../middleware/auth.js";
 
 const auth = new Hono();
 
@@ -64,7 +66,7 @@ function getGoogleConfig(c) {
  */
 auth.post("/sign-up", async (c) => {
   try {
-    const sql = getDb(c);
+    const db = getDrizzle(c);
     const body = await c.req.json();
     const { email, password, username, name } = body;
 
@@ -91,11 +93,11 @@ auth.post("/sign-up", async (c) => {
       .toLowerCase();
 
     // ตรวจสอบว่ามีอีเมลหรือชื่อผู้ใช้นี้อยู่แล้วหรือไม่
-    const existing = await sql`
-      SELECT id, email, username FROM users 
-      WHERE email = ${cleanEmail} OR username = ${finalUsername} 
-      LIMIT 1
-    `;
+    const existing = await db
+      .select({ id: users.id, email: users.email, username: users.username })
+      .from(users)
+      .where(or(eq(users.email, cleanEmail), eq(users.username, finalUsername)))
+      .limit(1);
 
     if (existing.length > 0) {
       const isEmail = existing[0].email === cleanEmail;
@@ -114,34 +116,31 @@ auth.post("/sign-up", async (c) => {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
     const displayName = name || finalUsername;
-    const defaultAvatar = `https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=120&q=80`;
+    const defaultAvatar = null;
 
-    // บันทึกลง Neon DB
-    const inserted = await sql`
-      INSERT INTO users (
-        email, 
-        password, 
-        username, 
-        "displayName", 
-        "avatarUrl",
-        "createdAt", 
-        "updatedAt"
-      ) VALUES (
-        ${cleanEmail}, 
-        ${hashedPassword}, 
-        ${finalUsername}, 
-        ${displayName}, 
-        ${defaultAvatar},
-        NOW(), 
-        NOW()
-      )
-      RETURNING id, email, username, "displayName", "avatarUrl", "createdAt"
-    `;
+    // บันทึกลง Neon DB ผ่าน Drizzle ORM
+    const inserted = await db
+      .insert(users)
+      .values({
+        email: cleanEmail,
+        password: hashedPassword,
+        username: finalUsername,
+        displayName,
+        avatarUrl: defaultAvatar,
+      })
+      .returning({
+        id: users.id,
+        email: users.email,
+        username: users.username,
+        displayName: users.displayName,
+        avatarUrl: users.avatarUrl,
+        createdAt: users.createdAt,
+      });
 
     const user = inserted[0];
     
     // สร้าง Session ลงในฐานข้อมูล Neon DB ตาราง sessions
-    const session = await createDbSession(sql, user.id, c);
+    const session = await createDbSession(db, user.id, c);
 
     const isLocalhost =
       c.req.url.includes("localhost") || c.req.url.includes("127.0.0.1");
@@ -157,7 +156,7 @@ auth.post("/sign-up", async (c) => {
     return c.json(
       {
         success: true,
-        message: "Account created successfully",
+        message: "User registered successfully",
         token: session.token,
         user,
       },
@@ -166,7 +165,7 @@ auth.post("/sign-up", async (c) => {
   } catch (err) {
     console.error("Sign-up error:", err);
     return c.json(
-      { success: false, message: err.message || "Failed to sign up" },
+      { success: false, message: err.message || "Registration failed" },
       500,
     );
   }
@@ -177,7 +176,7 @@ auth.post("/sign-up", async (c) => {
  */
 auth.post("/sign-in", async (c) => {
   try {
-    const sql = getDb(c);
+    const db = getDrizzle(c);
     const body = await c.req.json();
     const { email, password } = body;
 
@@ -189,21 +188,29 @@ auth.post("/sign-in", async (c) => {
     }
 
     const cleanEmail = email.trim().toLowerCase();
-    const users = await sql`
-      SELECT id, email, username, password, "displayName", "avatarUrl", "isBanned", bio
-      FROM users 
-      WHERE email = ${cleanEmail} OR username = ${cleanEmail}
-      LIMIT 1
-    `;
+    const userList = await db
+      .select({
+        id: users.id,
+        email: users.email,
+        username: users.username,
+        password: users.password,
+        displayName: users.displayName,
+        avatarUrl: users.avatarUrl,
+        isBanned: users.isBanned,
+        bio: users.bio,
+      })
+      .from(users)
+      .where(or(eq(users.email, cleanEmail), eq(users.username, cleanEmail)))
+      .limit(1);
 
-    if (users.length === 0) {
+    if (userList.length === 0) {
       return c.json(
         { success: false, message: "Invalid email or password" },
         401,
       );
     }
 
-    const user = users[0];
+    const user = userList[0];
 
     if (user.isBanned) {
       return c.json(
@@ -232,7 +239,7 @@ auth.post("/sign-in", async (c) => {
     }
 
     // สร้าง Session ลงในฐานข้อมูล Neon DB ตาราง sessions
-    const session = await createDbSession(sql, user.id, c);
+    const session = await createDbSession(db, user.id, c);
 
     const isLocalhost =
       c.req.url.includes("localhost") || c.req.url.includes("127.0.0.1");
@@ -245,25 +252,18 @@ auth.post("/sign-in", async (c) => {
       sameSite: "Lax",
     });
 
-    const safeUser = {
-      id: user.id,
-      email: user.email,
-      username: user.username,
-      displayName: user.displayName,
-      avatarUrl: user.avatarUrl,
-      bio: user.bio,
-    };
+    const { password: _, ...userWithoutPassword } = user;
 
     return c.json({
       success: true,
       message: "Signed in successfully",
       token: session.token,
-      user: safeUser,
+      user: userWithoutPassword,
     });
   } catch (err) {
     console.error("Sign-in error:", err);
     return c.json(
-      { success: false, message: err.message || "Failed to sign in" },
+      { success: false, message: err.message || "Sign-in failed" },
       500,
     );
   }
@@ -275,22 +275,33 @@ auth.post("/sign-in", async (c) => {
 auth.get("/me", requireAuth, async (c) => {
   try {
     const authUser = c.get("user");
-    const sql = getDb(c);
+    const db = getDrizzle(c);
 
-    const users = await sql`
-      SELECT id, email, username, "displayName", "avatarUrl", bio, location, banner, website, "createdAt"
-      FROM users 
-      WHERE id = ${authUser.id}
-      LIMIT 1
-    `;
+    const userList = await db
+      .select({
+        id: users.id,
+        email: users.email,
+        username: users.username,
+        displayName: users.displayName,
+        avatarUrl: users.avatarUrl,
+        bio: users.bio,
+        location: users.location,
+        banner: users.banner,
+        website: users.website,
+        socialLinks: users.socialLinks,
+        createdAt: users.createdAt,
+      })
+      .from(users)
+      .where(eq(users.id, authUser.id))
+      .limit(1);
 
-    if (users.length === 0) {
+    if (userList.length === 0) {
       return c.json({ success: false, message: "User not found" }, 404);
     }
 
     return c.json({
       success: true,
-      user: users[0],
+      user: userList[0],
     });
   } catch (err) {
     console.error("Get /me error:", err);
@@ -305,8 +316,8 @@ auth.post("/sign-out", async (c) => {
   try {
     const token = extractToken(c);
     if (token) {
-      const sql = getDb(c);
-      await sql`DELETE FROM sessions WHERE token = ${token}`;
+      const db = getDrizzle(c);
+      await db.delete(sessions).where(eq(sessions.token, token));
     }
   } catch (err) {
     console.error("Sign-out DB error:", err);
@@ -328,65 +339,70 @@ auth.get("/google", (c) => {
         message:
           "GOOGLE_CLIENT_ID is not configured in environment variables",
       },
-      500
+      500,
     );
   }
 
-  const rootUrl = "https://accounts.google.com/o/oauth2/v2/auth";
+  const state = Math.random().toString(36).substring(7);
 
-  const params = new URLSearchParams({
-    client_id: clientId,
-    redirect_uri: redirectUri,
-    response_type: "code",
-    scope: "openid email profile",
-    access_type: "offline",
-    prompt: "consent",
+  const googleAuthUrl = new URL(
+    "https://accounts.google.com/o/oauth2/v2/auth",
+  );
+  googleAuthUrl.searchParams.set("client_id", clientId);
+  googleAuthUrl.searchParams.set("redirect_uri", redirectUri);
+  googleAuthUrl.searchParams.set("response_type", "code");
+  googleAuthUrl.searchParams.set("scope", "openid email profile");
+  googleAuthUrl.searchParams.set("access_type", "offline");
+  googleAuthUrl.searchParams.set("state", state);
+  googleAuthUrl.searchParams.set("prompt", "select_account");
+
+  return c.json({
+    success: true,
+    url: googleAuthUrl.toString(),
   });
-
-  const url = `${rootUrl}?${params.toString()}`;
-
-  // หาก request ขอ json ให้ส่ง url กลับไป หรือ redirect โดยตรง
-  if (c.req.header("Accept")?.includes("application/json")) {
-    return c.json({ success: true, url });
-  }
-
-  return c.redirect(url);
 });
 
 /**
  * 6. GET /api/auth/google/callback - Callback จาก Google OAuth
  */
 auth.get("/google/callback", async (c) => {
+  const { clientId, clientSecret, clientUrl, redirectUri } =
+    getGoogleConfig(c);
+  const code = c.req.query("code");
+  const error = c.req.query("error");
+
+  if (error || !code) {
+    return c.redirect(
+      `${clientUrl}/sign-in?error=${encodeURIComponent(error || "no_code")}`,
+    );
+  }
+
   try {
-    const { clientId, clientSecret, redirectUri, clientUrl } =
-      getGoogleConfig(c);
-    const code = c.req.query("code");
-    const error = c.req.query("error");
+    // 1. แลกเปลี่ยน Auth Code เป็น Access Token จาก Google
+    const tokenParams = new URLSearchParams({
+      code,
+      client_id: clientId,
+      client_secret: clientSecret,
+      redirect_uri: redirectUri,
+      grant_type: "authorization_code",
+    });
 
-    if (error || !code) {
-      return c.redirect(`${clientUrl}/sign-in?error=google_auth_failed`);
-    }
-
-    // 1. แลก Authorization Code เป็น Tokens
     const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        code,
-        client_id: clientId,
-        client_secret: clientSecret,
-        redirect_uri: redirectUri,
-        grant_type: "authorization_code",
-      }),
+      body: tokenParams.toString(),
     });
 
     const tokenData = await tokenRes.json();
-    if (!tokenData.access_token) {
-      console.error("Google token exchange failed:", tokenData);
-      return c.redirect(`${clientUrl}/sign-in?error=token_exchange_failed`);
+
+    if (!tokenRes.ok || !tokenData.access_token) {
+      console.error("Google token exchange error:", tokenData);
+      return c.redirect(
+        `${clientUrl}/sign-in?error=token_exchange_failed`,
+      );
     }
 
-    // 2. ดึงข้อมูล User จาก Google UserInfo API
+    // 2. ดึงข้อมูล User Profile จาก Google
     const userRes = await fetch(
       "https://www.googleapis.com/oauth2/v2/userinfo",
       {
@@ -399,27 +415,31 @@ auth.get("/google/callback", async (c) => {
       return c.redirect(`${clientUrl}/sign-in?error=no_email_from_google`);
     }
 
-    const sql = getDb(c);
+    const db = getDrizzle(c);
     const cleanEmail = googleUser.email.toLowerCase();
 
     // 3. ตรวจสอบว่ามี User ในระบบหรือยัง
-    let users = await sql`
-      SELECT id, email, username, "displayName", "avatarUrl" 
-      FROM users 
-      WHERE email = ${cleanEmail} 
-      LIMIT 1
-    `;
+    let userList = await db
+      .select({
+        id: users.id,
+        email: users.email,
+        username: users.username,
+        displayName: users.displayName,
+        avatarUrl: users.avatarUrl,
+      })
+      .from(users)
+      .where(eq(users.email, cleanEmail))
+      .limit(1);
 
     let user;
-    if (users.length > 0) {
-      user = users[0];
+    if (userList.length > 0) {
+      user = userList[0];
       // อัปเดตรูปถ้ายังไม่มี
       if (!user.avatarUrl && googleUser.picture) {
-        await sql`
-          UPDATE users 
-          SET "avatarUrl" = ${googleUser.picture}, "updatedAt" = NOW() 
-          WHERE id = ${user.id}
-        `;
+        await db
+          .update(users)
+          .set({ avatarUrl: googleUser.picture, updatedAt: sql`NOW()` })
+          .where(eq(users.id, user.id));
         user.avatarUrl = googleUser.picture;
       }
     } else {
@@ -429,57 +449,44 @@ auth.get("/google/callback", async (c) => {
         .replace(/[^a-zA-Z0-9_]/g, "");
       const uniqueUsername = `${baseUsername}_${Math.floor(1000 + Math.random() * 9000)}`;
 
-      const inserted = await sql`
-        INSERT INTO users (
-          email, 
-          username, 
-          "displayName", 
-          "avatarUrl", 
-          "isVerified",
-          "createdAt", 
-          "updatedAt"
-        ) VALUES (
-          ${cleanEmail}, 
-          ${uniqueUsername}, 
-          ${googleUser.name || baseUsername}, 
-          ${googleUser.picture || null}, 
-          true,
-          NOW(), 
-          NOW()
-        )
-        RETURNING id, email, username, "displayName", "avatarUrl"
-      `;
+      const inserted = await db
+        .insert(users)
+        .values({
+          email: cleanEmail,
+          username: uniqueUsername,
+          displayName: googleUser.name || baseUsername,
+          avatarUrl: googleUser.picture || null,
+          isVerified: true,
+        })
+        .returning({
+          id: users.id,
+          email: users.email,
+          username: users.username,
+          displayName: users.displayName,
+          avatarUrl: users.avatarUrl,
+        });
       user = inserted[0];
 
       // บันทึกความเชื่อมโยงใน accounts table
       const accountId = `acc_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-      await sql`
-        INSERT INTO accounts (
-          id, 
-          user_id, 
-          "accountId", 
-          "providerId", 
-          "accessToken", 
-          "createdAt", 
-          "updatedAt"
-        ) VALUES (
-          ${accountId}, 
-          ${user.id}, 
-          ${googleUser.id}, 
-          'google', 
-          ${tokenData.access_token}, 
-          NOW(), 
-          NOW()
-        )
-      `.catch((e) => console.warn("Account link warning:", e.message));
+      await db
+        .insert(accounts)
+        .values({
+          id: accountId,
+          userId: user.id,
+          accountId: String(googleUser.id),
+          providerId: 'google',
+          accessToken: tokenData.access_token,
+        })
+        .catch((e) => console.warn("Account link warning:", e.message));
     }
 
     // 4. สร้าง Session ในตาราง sessions ใน Neon DB
-    const session = await createDbSession(sql, user.id, c);
+    const session = await createDbSession(db, user.id, c);
 
     // 5. ส่ง Session Token กลับไปที่ Frontend ผ่าน Cookie และ Query Params
     const isLocalhost =
-      clientUrl.includes("localhost") || clientUrl.includes("127.0.0.1");
+      c.req.url.includes("localhost") || c.req.url.includes("127.0.0.1");
 
     setCookie(c, "auth_token", session.token, {
       path: "/",
@@ -489,34 +496,43 @@ auth.get("/google/callback", async (c) => {
       sameSite: "Lax",
     });
 
+    const userParam = encodeURIComponent(
+      JSON.stringify({
+        id: user.id,
+        email: user.email,
+        username: user.username,
+        name: user.displayName || user.username,
+        avatar: user.avatarUrl,
+      }),
+    );
+
     return c.redirect(
-      `${clientUrl}/?token=${session.token}&auth_token=${session.token}&auth_success=true`,
+      `${clientUrl}/sign-in?token=${session.token}&user=${userParam}`,
     );
   } catch (err) {
-    console.error("Google callback error:", err);
-    const { clientUrl } = getGoogleConfig(c);
+    console.error("Google OAuth callback error:", err);
     return c.redirect(`${clientUrl}/sign-in?error=server_error`);
   }
 });
 
 /**
- * 7. POST /api/auth/google/token - สำหรับ Frontend ส่ง Google ID Token มา Verify โดยตรง (เช่น Google One-Tap)
+ * 7. POST /api/auth/google-one-tap - รับ Google Credential JWT จาก Google One Tap
  */
-auth.post("/google/token", async (c) => {
+auth.post("/google-one-tap", async (c) => {
   try {
-    const { idToken, credential } = await c.req.json();
-    const tokenToVerify = idToken || credential;
+    const body = await c.req.json();
+    const { credential } = body;
 
-    if (!tokenToVerify) {
+    if (!credential) {
       return c.json(
-        { success: false, message: "Google token/credential is required" },
+        { success: false, message: "Missing Google credential" },
         400,
       );
     }
 
-    // ตรวจสอบ token กับ Google API
+    // ตรวจสอบ Google ID Token กับ Google Tokeninfo API
     const verifyRes = await fetch(
-      `https://oauth2.googleapis.com/tokeninfo?id_token=${tokenToVerify}`,
+      `https://oauth2.googleapis.com/tokeninfo?id_token=${credential}`,
     );
     const payload = await verifyRes.json();
 
@@ -527,24 +543,29 @@ auth.post("/google/token", async (c) => {
       );
     }
 
-    const sql = getDb(c);
+    const db = getDrizzle(c);
     const cleanEmail = payload.email.toLowerCase();
 
-    let users = await sql`
-      SELECT id, email, username, "displayName", "avatarUrl" 
-      FROM users 
-      WHERE email = ${cleanEmail} 
-      LIMIT 1
-    `;
+    let userList = await db
+      .select({
+        id: users.id,
+        email: users.email,
+        username: users.username,
+        displayName: users.displayName,
+        avatarUrl: users.avatarUrl,
+      })
+      .from(users)
+      .where(eq(users.email, cleanEmail))
+      .limit(1);
 
     let user;
-    if (users.length > 0) {
-      user = users[0];
+    if (userList.length > 0) {
+      user = userList[0];
       if (!user.avatarUrl && payload.picture) {
-        await sql`
-          UPDATE users SET "avatarUrl" = ${payload.picture}, "updatedAt" = NOW() 
-          WHERE id = ${user.id}
-        `;
+        await db
+          .update(users)
+          .set({ avatarUrl: payload.picture, updatedAt: sql`NOW()` })
+          .where(eq(users.id, user.id));
         user.avatarUrl = payload.picture;
       }
     } else {
@@ -553,31 +574,27 @@ auth.post("/google/token", async (c) => {
         .replace(/[^a-zA-Z0-9_]/g, "");
       const uniqueUsername = `${baseUsername}_${Math.floor(1000 + Math.random() * 9000)}`;
 
-      const inserted = await sql`
-        INSERT INTO users (
-          email, 
-          username, 
-          "displayName", 
-          "avatarUrl", 
-          "isVerified",
-          "createdAt", 
-          "updatedAt"
-        ) VALUES (
-          ${cleanEmail}, 
-          ${uniqueUsername}, 
-          ${payload.name || baseUsername}, 
-          ${payload.picture || null}, 
-          true,
-          NOW(), 
-          NOW()
-        )
-        RETURNING id, email, username, "displayName", "avatarUrl"
-      `;
+      const inserted = await db
+        .insert(users)
+        .values({
+          email: cleanEmail,
+          username: uniqueUsername,
+          displayName: payload.name || baseUsername,
+          avatarUrl: payload.picture || null,
+          isVerified: true,
+        })
+        .returning({
+          id: users.id,
+          email: users.email,
+          username: users.username,
+          displayName: users.displayName,
+          avatarUrl: users.avatarUrl,
+        });
       user = inserted[0];
     }
 
     // สร้าง Session ในตาราง sessions ใน Neon DB
-    const session = await createDbSession(sql, user.id, c);
+    const session = await createDbSession(db, user.id, c);
 
     const isLocalhost =
       c.req.url.includes("localhost") || c.req.url.includes("127.0.0.1");

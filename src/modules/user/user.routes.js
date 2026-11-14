@@ -1,7 +1,9 @@
 import { Hono } from 'hono';
-import { getDb } from '../../config/db';
-import { optionalAuth, requireAuth } from '../../middleware/auth';
-import { createNotification } from '../notification/notification.service';
+import { getDrizzle } from '../../config/db.js';
+import { users, follows, posts, postLikes, showcases, searchLogs } from '../../db/schema.js';
+import { optionalAuth, requireAuth } from '../../middleware/auth.js';
+import { createNotification } from '../notification/notification.service.js';
+import { eq, ne, and, or, ilike, sql, desc, count } from 'drizzle-orm';
 
 const userRouter = new Hono();
 
@@ -10,38 +12,34 @@ const userRouter = new Hono();
  */
 userRouter.get('/suggested', optionalAuth, async (c) => {
   try {
-    const sql = getDb(c);
+    const db = getDrizzle(c);
     const currentUser = c.get('user');
 
-    const users = await sql`
-      SELECT 
-        u.id,
-        u.username,
-        u."displayName",
-        u."avatarUrl",
-        u.bio,
-        u.location,
-        ${
-          currentUser?.id
-            ? sql`EXISTS(SELECT 1 FROM follows f WHERE f.follower_id = ${currentUser.id} AND f.following_id = u.id) as is_following`
-            : sql`false as is_following`
-        }
-      FROM users u
-      WHERE u.id != ${currentUser?.id || 0}
-      ORDER BY u.id DESC
-      LIMIT 5
-    `;
+    const userList = await db
+      .select({
+        id: users.id,
+        username: users.username,
+        displayName: users.displayName,
+        avatarUrl: users.avatarUrl,
+        bio: users.bio,
+        location: users.location,
+        isFollowing: currentUser?.id
+          ? sql`EXISTS(SELECT 1 FROM follows f WHERE f.follower_id = ${currentUser.id} AND f.following_id = ${users.id})`
+          : sql`false`,
+      })
+      .from(users)
+      .where(ne(users.id, currentUser?.id || 0))
+      .orderBy(desc(users.id))
+      .limit(5);
 
-    const formatted = users.map((u) => ({
+    const formatted = userList.map((u) => ({
       id: u.id,
       name: u.displayName || u.username,
       username: u.username,
-      avatar:
-        u.avatarUrl ||
-        'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=120&q=80',
+      avatar: u.avatarUrl || null,
       role: u.bio || 'Product Designer',
       location: u.location,
-      isFollowing: Boolean(u.is_following),
+      isFollowing: Boolean(u.isFollowing),
     }));
 
     return c.json({
@@ -63,40 +61,129 @@ userRouter.get('/search', optionalAuth, async (c) => {
     if (!q) {
       return c.json({ success: true, users: [] });
     }
-    const sql = getDb(c);
+    const db = getDrizzle(c);
     const currentUser = c.get('user');
+    const searchPattern = `%${q}%`;
 
-    const users = await sql`
-      SELECT 
-        u.id,
-        u.username,
-        u."displayName",
-        u."avatarUrl",
-        u.bio,
-        ${
-          currentUser?.id
-            ? sql`EXISTS(SELECT 1 FROM follows f WHERE f.follower_id = ${currentUser.id} AND f.following_id = u.id) as is_following`
-            : sql`false as is_following`
-        }
-      FROM users u
-      WHERE u.username ILIKE ${'%' + q + '%'} 
-         OR u."displayName" ILIKE ${'%' + q + '%'}
-         OR u.bio ILIKE ${'%' + q + '%'}
-      LIMIT 8
-    `;
+    const userList = await db
+      .select({
+        id: users.id,
+        username: users.username,
+        displayName: users.displayName,
+        avatarUrl: users.avatarUrl,
+        bio: users.bio,
+        isFollowing: currentUser?.id
+          ? sql`EXISTS(SELECT 1 FROM follows f WHERE f.follower_id = ${currentUser.id} AND f.following_id = ${users.id})`
+          : sql`false`,
+      })
+      .from(users)
+      .where(
+        or(
+          ilike(users.username, searchPattern),
+          ilike(users.displayName, searchPattern),
+          ilike(users.bio, searchPattern)
+        )
+      )
+      .limit(8);
 
-    const formatted = users.map((u) => ({
+    const formatted = userList.map((u) => ({
       id: u.id,
       name: u.displayName || u.username,
       username: u.username,
       avatar: u.avatarUrl || '',
       bio: u.bio || '',
-      isFollowing: Boolean(u.is_following),
+      isFollowing: Boolean(u.isFollowing),
     }));
+
+    // บันทึกประวัติการค้นหาลง search_logs
+    try {
+      const ipAddress =
+        c.req.header('cf-connecting-ip') ||
+        c.req.header('x-forwarded-for')?.split(',')[0]?.trim() ||
+        '127.0.0.1';
+      db.insert(searchLogs)
+        .values({
+          query: q,
+          userId: currentUser?.id || null,
+          searchType: 'users',
+          resultCount: formatted.length,
+          ipAddress,
+        })
+        .catch((e) => console.error('Error logging user search:', e));
+    } catch {}
 
     return c.json({ success: true, users: formatted });
   } catch (err) {
     console.error('Search users error:', err);
+    return c.json({ success: false, message: 'Server error' }, 500);
+  }
+});
+
+/**
+ * 2.1 GET /api/users/search/history - ดึงประวัติการค้นหาล่าสุดของผู้ใช้ที่ล็อกอิน
+ */
+userRouter.get('/search/history', requireAuth, async (c) => {
+  try {
+    const currentUser = c.get('user');
+    const db = getDrizzle(c);
+
+    const history = await db
+      .select({
+        id: searchLogs.id,
+        query: searchLogs.query,
+        searchType: searchLogs.searchType,
+        resultCount: searchLogs.resultCount,
+        createdAt: searchLogs.createdAt,
+      })
+      .from(searchLogs)
+      .where(eq(searchLogs.userId, currentUser.id))
+      .orderBy(desc(searchLogs.createdAt))
+      .limit(15);
+
+    return c.json({ success: true, history });
+  } catch (err) {
+    console.error('Get search history error:', err);
+    return c.json({ success: false, message: 'Server error' }, 500);
+  }
+});
+
+/**
+ * 2.2 DELETE /api/users/search/history - ล้างประวัติการค้นหาของผู้ใช้
+ */
+userRouter.delete('/search/history', requireAuth, async (c) => {
+  try {
+    const currentUser = c.get('user');
+    const db = getDrizzle(c);
+
+    await db.delete(searchLogs).where(eq(searchLogs.userId, currentUser.id));
+
+    return c.json({ success: true, message: 'Search history cleared' });
+  } catch (err) {
+    console.error('Clear search history error:', err);
+    return c.json({ success: false, message: 'Server error' }, 500);
+  }
+});
+
+/**
+ * 2.3 GET /api/users/search/trending - ดึงคำค้นหายอดนิยม
+ */
+userRouter.get('/search/trending', optionalAuth, async (c) => {
+  try {
+    const db = getDrizzle(c);
+
+    const trending = await db
+      .select({
+        query: searchLogs.query,
+        count: count(searchLogs.id),
+      })
+      .from(searchLogs)
+      .groupBy(searchLogs.query)
+      .orderBy(desc(count(searchLogs.id)))
+      .limit(10);
+
+    return c.json({ success: true, trending: trending.map((t) => t.query) });
+  } catch (err) {
+    console.error('Get trending search error:', err);
     return c.json({ success: false, message: 'Server error' }, 500);
   }
 });
@@ -107,32 +194,34 @@ userRouter.get('/search', optionalAuth, async (c) => {
 userRouter.get('/profile/:username', optionalAuth, async (c) => {
   try {
     const username = c.req.param('username').trim().toLowerCase();
-    const sql = getDb(c);
+    const db = getDrizzle(c);
     const currentUser = c.get('user');
 
-    const users = await sql`
-      SELECT 
-        id,
-        username,
-        "displayName",
-        "avatarUrl",
-        bio,
-        location,
-        banner,
-        website,
-        note,
-        "isVerified",
-        "createdAt"
-      FROM users 
-      WHERE LOWER(username) = ${username}
-      LIMIT 1
-    `;
+    const userList = await db
+      .select({
+        id: users.id,
+        username: users.username,
+        email: users.email,
+        displayName: users.displayName,
+        avatarUrl: users.avatarUrl,
+        bio: users.bio,
+        location: users.location,
+        banner: users.banner,
+        website: users.website,
+        note: users.note,
+        socialLinks: users.socialLinks,
+        isVerified: users.isVerified,
+        createdAt: users.createdAt,
+      })
+      .from(users)
+      .where(sql`LOWER(${users.username}) = ${username}`)
+      .limit(1);
 
-    if (users.length === 0) {
+    if (userList.length === 0) {
       return c.json({ success: false, message: 'User not found' }, 404);
     }
 
-    const u = users[0];
+    const u = userList[0];
 
     // สถิติต่าง ๆ: posts, followers, following, viewing (views รวม), likes (likes รวม)
     const [
@@ -143,19 +232,19 @@ userRouter.get('/profile/:username', optionalAuth, async (c) => {
       likesCountRes,
       isFollowingRes,
     ] = await Promise.all([
-      sql`SELECT COUNT(*)::int as count FROM posts WHERE user_id = ${u.id}`,
-      sql`SELECT COUNT(*)::int as count FROM follows WHERE following_id = ${u.id}`,
-      sql`SELECT COUNT(*)::int as count FROM follows WHERE follower_id = ${u.id}`,
-      sql`SELECT COALESCE(SUM(views_count), 0)::int as count FROM showcases WHERE user_id = ${u.id}`,
-      sql`
-        SELECT (
+      db.select({ count: count() }).from(posts).where(eq(posts.userId, u.id)),
+      db.select({ count: count() }).from(follows).where(eq(follows.followingId, u.id)),
+      db.select({ count: count() }).from(follows).where(eq(follows.followerId, u.id)),
+      db.select({ count: sql`COALESCE(SUM(${showcases.viewsCount}), 0)::int` }).from(showcases).where(eq(showcases.userId, u.id)),
+      db.select({
+        count: sql`(
           COALESCE((SELECT COUNT(*) FROM post_likes pl JOIN posts p ON pl.post_id = p.id WHERE p.user_id = ${u.id}), 0) +
           COALESCE((SELECT SUM(likes_count) FROM showcases WHERE user_id = ${u.id}), 0)
-        )::int as count
-      `,
+        )::int`,
+      }),
       currentUser?.id
-        ? sql`SELECT EXISTS(SELECT 1 FROM follows WHERE follower_id = ${currentUser.id} AND following_id = ${u.id}) as is_following`
-        : Promise.resolve([{ is_following: false }]),
+        ? db.select({ isFollowing: sql`EXISTS(SELECT 1 FROM follows WHERE follower_id = ${currentUser.id} AND following_id = ${u.id})` })
+        : Promise.resolve([{ isFollowing: false }]),
     ]);
 
     return c.json({
@@ -165,26 +254,25 @@ userRouter.get('/profile/:username', optionalAuth, async (c) => {
         name: u.displayName || u.username,
         username: u.username,
         email: u.email,
-        avatar:
-          u.avatarUrl ||
-          'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=200&q=80',
+        avatar: u.avatarUrl || null,
         banner:
           u.banner ||
-          'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=1200&q=80',
+          '/empty/no-image.png',
         note: u.note || '',
         isVerified: Boolean(u.isVerified ?? true),
         bio: u.bio || '',
         location: u.location || '',
         website: u.website || '',
+        socialLinks: u.socialLinks || {},
         joinedDate: u.createdAt,
         stats: {
-          posts: postsCountRes[0]?.count || 0,
-          followers: followersCountRes[0]?.count || 0,
-          following: followingCountRes[0]?.count || 0,
-          viewing: viewsCountRes[0]?.count || 0,
-          likes: likesCountRes[0]?.count || 0,
+          posts: Number(postsCountRes[0]?.count || 0),
+          followers: Number(followersCountRes[0]?.count || 0),
+          following: Number(followingCountRes[0]?.count || 0),
+          viewing: Number(viewsCountRes[0]?.count || 0),
+          likes: Number(likesCountRes[0]?.count || 0),
         },
-        isFollowing: Boolean(isFollowingRes[0]?.is_following),
+        isFollowing: Boolean(isFollowingRes[0]?.isFollowing ?? isFollowingRes[0]?.is_following),
         isSelf: currentUser?.id === u.id,
       },
     });
@@ -195,12 +283,12 @@ userRouter.get('/profile/:username', optionalAuth, async (c) => {
 });
 
 /**
- * 3. PATCH /api/users/profile - อัปเดตโปรไฟล์ของตัวเอง
+ * 4. PATCH /api/users/profile - อัปเดตโปรไฟล์ของตัวเอง
  */
 userRouter.patch('/profile', requireAuth, async (c) => {
   try {
     const user = c.get('user');
-    const sql = getDb(c);
+    const db = getDrizzle(c);
     const body = await c.req.json();
 
     const {
@@ -213,6 +301,7 @@ userRouter.patch('/profile', requireAuth, async (c) => {
       website,
       note,
       username,
+      socialLinks,
     } = body;
 
     const finalAvatar = avatarUrl || avatar;
@@ -238,11 +327,12 @@ userRouter.patch('/profile', requireAuth, async (c) => {
         );
       }
 
-      const existing = await sql`
-        SELECT id FROM users 
-        WHERE LOWER(username) = ${cleanUsername} AND id != ${user.id} 
-        LIMIT 1
-      `;
+      const existing = await db
+        .select({ id: users.id })
+        .from(users)
+        .where(and(sql`LOWER(${users.username}) = ${cleanUsername}`, ne(users.id, user.id)))
+        .limit(1);
+
       if (existing.length > 0) {
         return c.json(
           { success: false, message: 'Username is already taken by another creator' },
@@ -252,21 +342,34 @@ userRouter.patch('/profile', requireAuth, async (c) => {
       finalUsername = cleanUsername;
     }
 
-    const updated = await sql`
-      UPDATE users 
-      SET 
-        username = COALESCE(${finalUsername}, username),
-        "displayName" = COALESCE(${displayName}, "displayName"),
-        bio = COALESCE(${bio}, bio),
-        "avatarUrl" = COALESCE(${finalAvatar}, "avatarUrl"),
-        banner = COALESCE(${banner}, banner),
-        location = COALESCE(${location}, location),
-        website = COALESCE(${website}, website),
-        note = COALESCE(${note}, note),
-        "updatedAt" = NOW()
-      WHERE id = ${user.id}
-      RETURNING id, username, "displayName", "avatarUrl", bio, location, banner, website, note, "updatedAt"
-    `;
+    const updateData = { updatedAt: sql`NOW()` };
+    if (finalUsername !== undefined) updateData.username = finalUsername;
+    if (displayName !== undefined) updateData.displayName = displayName;
+    if (bio !== undefined) updateData.bio = bio;
+    if (finalAvatar !== undefined) updateData.avatarUrl = finalAvatar;
+    if (banner !== undefined) updateData.banner = banner;
+    if (location !== undefined) updateData.location = location;
+    if (website !== undefined) updateData.website = website;
+    if (note !== undefined) updateData.note = note;
+    if (socialLinks !== undefined) updateData.socialLinks = socialLinks;
+
+    const updated = await db
+      .update(users)
+      .set(updateData)
+      .where(eq(users.id, user.id))
+      .returning({
+        id: users.id,
+        username: users.username,
+        displayName: users.displayName,
+        avatarUrl: users.avatarUrl,
+        bio: users.bio,
+        location: users.location,
+        banner: users.banner,
+        website: users.website,
+        note: users.note,
+        socialLinks: users.socialLinks,
+        updatedAt: users.updatedAt,
+      });
 
     return c.json({
       success: true,
@@ -280,12 +383,25 @@ userRouter.patch('/profile', requireAuth, async (c) => {
 });
 
 /**
- * 4. POST /api/users/:id/follow - สลับสถานะ Follow / Unfollow
+ * 5. POST /api/users/:id/follow - สลับสถานะ Follow / Unfollow
  */
 userRouter.post('/:id/follow', requireAuth, async (c) => {
   try {
-    const targetId = parseInt(c.req.param('id'), 10);
+    const rawId = c.req.param('id');
     const user = c.get('user');
+    const db = getDrizzle(c);
+
+    let targetId = parseInt(rawId, 10);
+    if (isNaN(targetId)) {
+      const uRes = await db
+        .select({ id: users.id })
+        .from(users)
+        .where(sql`LOWER(${users.username}) = ${rawId.toLowerCase()}`)
+        .limit(1);
+      if (uRes.length > 0) {
+        targetId = uRes[0].id;
+      }
+    }
 
     if (isNaN(targetId) || targetId === user.id) {
       return c.json(
@@ -294,53 +410,58 @@ userRouter.post('/:id/follow', requireAuth, async (c) => {
       );
     }
 
-    const sql = getDb(c);
-
     // ตรวจสอบว่า target user มีอยู่จริง
-    const targetUser = await sql`SELECT id FROM users WHERE id = ${targetId} LIMIT 1`;
+    const targetUser = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.id, targetId))
+      .limit(1);
+
     if (targetUser.length === 0) {
       return c.json({ success: false, message: 'User not found' }, 404);
     }
 
     // ตรวจสอบว่าติดตามอยู่แล้วหรือไม่
-    const existing = await sql`
-      SELECT id FROM follows 
-      WHERE follower_id = ${user.id} AND following_id = ${targetId}
-      LIMIT 1
-    `;
+    const existing = await db
+      .select({ id: follows.id })
+      .from(follows)
+      .where(and(eq(follows.followerId, user.id), eq(follows.followingId, targetId)))
+      .limit(1);
 
     let isFollowing = false;
     if (existing.length > 0) {
       // Unfollow
-      await sql`
-        DELETE FROM follows 
-        WHERE follower_id = ${user.id} AND following_id = ${targetId}
-      `;
+      await db
+        .delete(follows)
+        .where(and(eq(follows.followerId, user.id), eq(follows.followingId, targetId)));
       isFollowing = false;
     } else {
       // Follow
-      await sql`
-        INSERT INTO follows (follower_id, following_id, "createdAt") 
-        VALUES (${user.id}, ${targetId}, NOW())
-      `;
+      await db
+        .insert(follows)
+        .values({
+          followerId: user.id,
+          followingId: targetId,
+        });
       isFollowing = true;
 
       // สร้างการแจ้งเตือน Follow
-      await createNotification(sql, {
+      await createNotification(db, {
         userId: targetId,
         actorId: user.id,
         type: 'follow',
       });
     }
 
-    const countRes = await sql`
-      SELECT COUNT(*)::int as count FROM follows WHERE following_id = ${targetId}
-    `;
+    const countRes = await db
+      .select({ count: count() })
+      .from(follows)
+      .where(eq(follows.followingId, targetId));
 
     return c.json({
       success: true,
       isFollowing,
-      followersCount: countRes[0]?.count || 0,
+      followersCount: Number(countRes[0]?.count || 0),
     });
   } catch (err) {
     console.error('Follow error:', err);
@@ -349,51 +470,69 @@ userRouter.post('/:id/follow', requireAuth, async (c) => {
 });
 
 /**
- * 5. GET /api/users/:id/posts - ดึงโพสต์ทั้งหมดของผู้ใช้นี้
+ * 6. GET /api/users/:id/posts - ดึงโพสต์ทั้งหมดของผู้ใช้นี้
  */
 userRouter.get('/:id/posts', optionalAuth, async (c) => {
   try {
     const rawParam = c.req.param('id');
-    const sql = getDb(c);
+    const db = getDrizzle(c);
     const currentUser = c.get('user');
 
     let userId = parseInt(rawParam, 10);
     if (isNaN(userId)) {
-      const uRes = await sql`
-        SELECT id FROM users WHERE LOWER(username) = ${rawParam.toLowerCase()} LIMIT 1
-      `;
+      const uRes = await db
+        .select({ id: users.id })
+        .from(users)
+        .where(sql`LOWER(${users.username}) = ${rawParam.toLowerCase()}`)
+        .limit(1);
+
       if (uRes.length === 0) {
         return c.json({ success: true, posts: [] });
       }
       userId = uRes[0].id;
     }
 
-    const posts = await sql`
-      SELECT 
-        p.*,
-        u.username as author_username,
-        u."displayName" as author_name,
-        u."avatarUrl" as author_avatar,
-        ${
-          currentUser?.id
-            ? sql`EXISTS(SELECT 1 FROM post_likes pl WHERE pl.post_id = p.id AND pl.user_id = ${currentUser.id}) as is_liked`
-            : sql`false as is_liked`
-        }
-      FROM posts p
-      LEFT JOIN users u ON p.user_id = u.id
-      WHERE p.user_id = ${userId}
-      ORDER BY p."createdAt" DESC
-    `;
+    const postList = await db
+      .select({
+        id: posts.id,
+        userId: posts.userId,
+        caption: posts.caption,
+        mediaUrls: posts.mediaUrls,
+        serviceId: posts.serviceId,
+        serviceTitle: posts.serviceTitle,
+        collaborators: posts.collaborators,
+        tags: posts.tags,
+        clientName: posts.clientName,
+        likesCount: posts.likesCount,
+        viewsCount: posts.viewsCount,
+        sharesCount: posts.sharesCount,
+        commentsCount: posts.commentsCount,
+        createdAt: posts.createdAt,
+        updatedAt: posts.updatedAt,
+        authorUsername: users.username,
+        authorName: users.displayName,
+        authorAvatar: users.avatarUrl,
+        isLiked: currentUser?.id
+          ? sql`EXISTS(SELECT 1 FROM post_likes pl WHERE pl.post_id = ${posts.id} AND pl.user_id = ${currentUser.id})`
+          : sql`false`,
+        isFollowingAuthor: currentUser?.id
+          ? sql`EXISTS(SELECT 1 FROM follows f WHERE f.follower_id = ${currentUser.id} AND f.following_id = ${posts.userId})`
+          : sql`false`,
+      })
+      .from(posts)
+      .leftJoin(users, eq(posts.userId, users.id))
+      .where(eq(posts.userId, userId))
+      .orderBy(desc(posts.createdAt));
 
-    const formatted = posts.map((p) => {
+    const formatted = postList.map((p) => {
       let images = [];
-      if (Array.isArray(p.media_urls)) {
-        images = p.media_urls;
-      } else if (typeof p.media_urls === 'string') {
+      if (Array.isArray(p.mediaUrls)) {
+        images = p.mediaUrls;
+      } else if (typeof p.mediaUrls === 'string') {
         try {
-          images = JSON.parse(p.media_urls);
+          images = JSON.parse(p.mediaUrls);
         } catch {
-          images = [p.media_urls];
+          images = [p.mediaUrls];
         }
       }
 
@@ -404,17 +543,18 @@ userRouter.get('/:id/posts', optionalAuth, async (c) => {
         images,
         media_urls: images,
         tags: Array.isArray(p.tags) ? p.tags : [],
-        likesCount: p.likes_count || 0,
-        commentsCount: p.comments_count || 0,
-        sharesCount: p.shares_count || 0,
-        isLiked: Boolean(p.is_liked),
+        likesCount: p.likesCount || 0,
+        commentsCount: p.commentsCount || 0,
+        sharesCount: p.sharesCount || 0,
+        isLiked: Boolean(p.isLiked),
         createdAt: p.createdAt,
         updatedAt: p.updatedAt,
         author: {
-          id: p.user_id,
-          name: p.author_name || p.author_username,
-          username: p.author_username,
-          avatar: p.author_avatar,
+          id: p.userId,
+          name: p.authorName || p.authorUsername,
+          username: p.authorUsername,
+          avatar: p.authorAvatar,
+          isFollowing: Boolean(p.isFollowingAuthor),
         },
       };
     });
@@ -429,5 +569,104 @@ userRouter.get('/:id/posts', optionalAuth, async (c) => {
   }
 });
 
-export default userRouter;
+/**
+ * 8. GET /api/users/:id/likes - ดึงโพสต์ที่ผู้ใช้นี้กด Like
+ */
+userRouter.get('/:id/likes', optionalAuth, async (c) => {
+  try {
+    const rawParam = c.req.param('id');
+    const db = getDrizzle(c);
+    const currentUser = c.get('user');
 
+    let targetUserId = parseInt(rawParam, 10);
+    if (isNaN(targetUserId)) {
+      const uRes = await db
+        .select({ id: users.id })
+        .from(users)
+        .where(sql`LOWER(${users.username}) = ${rawParam.toLowerCase()}`)
+        .limit(1);
+
+      if (uRes.length === 0) {
+        return c.json({ success: true, posts: [] });
+      }
+      targetUserId = uRes[0].id;
+    }
+
+    const likedPostList = await db
+      .select({
+        id: posts.id,
+        userId: posts.userId,
+        caption: posts.caption,
+        mediaUrls: posts.mediaUrls,
+        serviceId: posts.serviceId,
+        serviceTitle: posts.serviceTitle,
+        collaborators: posts.collaborators,
+        tags: posts.tags,
+        clientName: posts.clientName,
+        likesCount: posts.likesCount,
+        viewsCount: posts.viewsCount,
+        sharesCount: posts.sharesCount,
+        commentsCount: posts.commentsCount,
+        createdAt: posts.createdAt,
+        updatedAt: posts.updatedAt,
+        authorUsername: users.username,
+        authorName: users.displayName,
+        authorAvatar: users.avatarUrl,
+        isLiked: currentUser?.id
+          ? sql`EXISTS(SELECT 1 FROM post_likes pl WHERE pl.post_id = ${posts.id} AND pl.user_id = ${currentUser.id})`
+          : sql`true`,
+        isFollowingAuthor: currentUser?.id
+          ? sql`EXISTS(SELECT 1 FROM follows f WHERE f.follower_id = ${currentUser.id} AND f.following_id = ${posts.userId})`
+          : sql`false`,
+      })
+      .from(postLikes)
+      .innerJoin(posts, eq(postLikes.postId, posts.id))
+      .leftJoin(users, eq(posts.userId, users.id))
+      .where(eq(postLikes.userId, targetUserId))
+      .orderBy(desc(postLikes.createdAt));
+
+    const formatted = likedPostList.map((p) => {
+      let images = [];
+      if (Array.isArray(p.mediaUrls)) {
+        images = p.mediaUrls;
+      } else if (typeof p.mediaUrls === 'string') {
+        try {
+          images = JSON.parse(p.mediaUrls);
+        } catch {
+          images = [p.mediaUrls];
+        }
+      }
+
+      return {
+        id: p.id,
+        content: p.caption,
+        caption: p.caption,
+        images,
+        media_urls: images,
+        tags: Array.isArray(p.tags) ? p.tags : [],
+        likesCount: p.likesCount || 0,
+        commentsCount: p.commentsCount || 0,
+        sharesCount: p.sharesCount || 0,
+        isLiked: Boolean(p.isLiked),
+        createdAt: p.createdAt,
+        author: {
+          id: p.userId,
+          name: p.authorName || p.authorUsername,
+          username: p.authorUsername,
+          avatar: p.authorAvatar,
+          isFollowing: Boolean(p.isFollowingAuthor),
+        },
+      };
+    });
+
+    return c.json({
+      success: true,
+      posts: formatted,
+    });
+  } catch (err) {
+    console.error('Get liked posts error:', err);
+    return c.json({ success: false, message: 'Server error' }, 500);
+  }
+});
+
+export default userRouter;

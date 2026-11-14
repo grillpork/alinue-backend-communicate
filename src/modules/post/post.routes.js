@@ -1,14 +1,16 @@
 import { Hono } from 'hono';
-import { getDb } from '../../config/db';
-import { optionalAuth, requireAuth } from '../../middleware/auth';
+import { getDrizzle, getDb } from '../../config/db.js';
+import { posts, postLikes, postComments, postShares, users, showcases, searchLogs } from '../../db/schema.js';
+import { optionalAuth, requireAuth } from '../../middleware/auth.js';
 import {
   checkImageUrl,
   deleteFromR2,
   checkUserTimeoutStatus,
   recordModerationViolation,
   getClientIp,
-} from '../../utils/moderation';
-import { createNotification } from '../notification/notification.service';
+} from '../../utils/moderation.js';
+import { createNotification } from '../notification/notification.service.js';
+import { eq, and, or, ilike, sql, desc, asc, count } from 'drizzle-orm';
 
 const postRouter = new Hono();
 
@@ -18,7 +20,7 @@ const postRouter = new Hono();
  */
 postRouter.get('/', optionalAuth, async (c) => {
   try {
-    const sql = getDb(c);
+    const db = getDrizzle(c);
     const currentUser = c.get('user');
 
     const page = Math.max(1, parseInt(c.req.query('page') || '1', 10));
@@ -28,110 +30,107 @@ postRouter.get('/', optionalAuth, async (c) => {
     const userId = c.req.query('userId');
     const search = c.req.query('search');
 
-    // ดึงโพสต์พร้อมข้อมูลผู้เขียนและสถานะ isLiked
-    let posts;
-    if (currentUser?.id) {
-      posts = await sql`
-        SELECT 
-          p.id,
-          p.user_id,
-          p.caption,
-          p.media_urls,
-          p.tags,
-          p.collaborators,
-          p.likes_count,
-          p.comments_count,
-          p.shares_count,
-          p.views_count,
-          p."createdAt",
-          p."updatedAt",
-          u.username as author_username,
-          u."displayName" as author_name,
-          u."avatarUrl" as author_avatar,
-          u.bio as author_bio,
-          EXISTS(
-            SELECT 1 FROM post_likes pl 
-            WHERE pl.post_id = p.id AND pl.user_id = ${currentUser.id}
-          ) as is_liked
-        FROM posts p
-        LEFT JOIN users u ON p.user_id = u.id
-        WHERE 1=1
-        ${tag ? sql`AND p.tags ? ${tag}` : sql``}
-        ${userId ? sql`AND p.user_id = ${parseInt(userId, 10)}` : sql``}
-        ${search ? sql`AND (p.caption ILIKE ${'%' + search + '%'} OR u."displayName" ILIKE ${'%' + search + '%'} OR u.username ILIKE ${'%' + search + '%'})` : sql``}
-        ORDER BY p."createdAt" DESC
-        LIMIT ${limit} OFFSET ${offset}
-      `;
-    } else {
-      posts = await sql`
-        SELECT 
-          p.id,
-          p.user_id,
-          p.caption,
-          p.media_urls,
-          p.tags,
-          p.collaborators,
-          p.likes_count,
-          p.comments_count,
-          p.shares_count,
-          p.views_count,
-          p."createdAt",
-          p."updatedAt",
-          u.username as author_username,
-          u."displayName" as author_name,
-          u."avatarUrl" as author_avatar,
-          u.bio as author_bio,
-          false as is_liked
-        FROM posts p
-        LEFT JOIN users u ON p.user_id = u.id
-        WHERE 1=1
-        ${tag ? sql`AND p.tags ? ${tag}` : sql``}
-        ${userId ? sql`AND p.user_id = ${parseInt(userId, 10)}` : sql``}
-        ${search ? sql`AND (p.caption ILIKE ${'%' + search + '%'} OR u."displayName" ILIKE ${'%' + search + '%'} OR u.username ILIKE ${'%' + search + '%'})` : sql``}
-        ORDER BY p."createdAt" DESC
-        LIMIT ${limit} OFFSET ${offset}
-      `;
+    const conditions = [];
+    if (tag) conditions.push(sql`${posts.tags} ? ${tag}`);
+    if (userId) conditions.push(eq(posts.userId, parseInt(userId, 10)));
+    if (search) {
+      const searchPattern = `%${search}%`;
+      conditions.push(
+        or(
+          ilike(posts.caption, searchPattern),
+          ilike(users.displayName, searchPattern),
+          ilike(users.username, searchPattern)
+        )
+      );
     }
+    const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+
+    const postList = await db
+      .select({
+        id: posts.id,
+        userId: posts.userId,
+        caption: posts.caption,
+        mediaUrls: posts.mediaUrls,
+        tags: posts.tags,
+        collaborators: posts.collaborators,
+        likesCount: posts.likesCount,
+        commentsCount: posts.commentsCount,
+        sharesCount: posts.sharesCount,
+        viewsCount: posts.viewsCount,
+        createdAt: posts.createdAt,
+        updatedAt: posts.updatedAt,
+        authorUsername: users.username,
+        authorName: users.displayName,
+        authorAvatar: users.avatarUrl,
+        authorBio: users.bio,
+        isLiked: currentUser?.id
+          ? sql`EXISTS(SELECT 1 FROM post_likes pl WHERE pl.post_id = ${posts.id} AND pl.user_id = ${currentUser.id})`
+          : sql`false`,
+        isFollowingAuthor: currentUser?.id
+          ? sql`EXISTS(SELECT 1 FROM follows f WHERE f.follower_id = ${currentUser.id} AND f.following_id = ${posts.userId})`
+          : sql`false`,
+      })
+      .from(posts)
+      .leftJoin(users, eq(posts.userId, users.id))
+      .where(whereClause)
+      .orderBy(desc(posts.createdAt))
+      .limit(limit)
+      .offset(offset);
 
     // จัดรูปแบบให้เข้ากับ Frontend
-    const formattedPosts = posts.map((p) => {
+    const formattedPosts = postList.map((p) => {
       let images = [];
-      if (Array.isArray(p.media_urls)) {
-        images = p.media_urls;
-      } else if (typeof p.media_urls === 'string') {
+      if (Array.isArray(p.mediaUrls)) {
+        images = p.mediaUrls;
+      } else if (typeof p.mediaUrls === 'string') {
         try {
-          images = JSON.parse(p.media_urls);
+          images = JSON.parse(p.mediaUrls);
         } catch {
-          images = [p.media_urls];
+          images = [p.mediaUrls];
         }
       }
 
       return {
         id: p.id,
-        content: p.caption || '',
-        caption: p.caption || '',
+        content: p.caption,
+        caption: p.caption,
         images,
         media_urls: images,
         tags: Array.isArray(p.tags) ? p.tags : [],
-        collaborators: p.collaborators || [],
-        likesCount: p.likes_count || 0,
-        commentsCount: p.comments_count || 0,
-        sharesCount: p.shares_count || 0,
-        viewsCount: p.views_count || 0,
-        isLiked: Boolean(p.is_liked),
+        collaborators: Array.isArray(p.collaborators) ? p.collaborators : [],
+        likesCount: p.likesCount || 0,
+        commentsCount: p.commentsCount || 0,
+        sharesCount: p.sharesCount || 0,
+        viewsCount: p.viewsCount || 0,
+        isLiked: Boolean(p.isLiked),
         createdAt: p.createdAt,
         updatedAt: p.updatedAt,
         author: {
-          id: p.user_id,
-          name: p.author_name || p.author_username || 'Anonymous',
-          username: p.author_username || 'user',
-          avatar:
-            p.author_avatar ||
-            'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=120&q=80',
-          bio: p.author_bio || '',
+          id: p.userId,
+          name: p.authorName || p.authorUsername || 'Anonymous',
+          username: p.authorUsername || 'user',
+          avatar: p.authorAvatar || null,
+          bio: p.authorBio || '',
+          isFollowing: Boolean(p.isFollowingAuthor),
         },
       };
     });
+
+    // บันทึกประวัติการค้นหาถ้ามีการค้นหาโพสต์
+    if (search && search.trim()) {
+      try {
+        const ipAddress = getClientIp(c);
+        db.insert(searchLogs)
+          .values({
+            query: search.trim(),
+            userId: currentUser?.id || null,
+            searchType: 'posts',
+            resultCount: formattedPosts.length,
+            ipAddress,
+          })
+          .catch(() => {});
+      } catch {}
+    }
 
     return c.json({
       success: true,
@@ -157,11 +156,12 @@ postRouter.get('/', optionalAuth, async (c) => {
 postRouter.post('/', requireAuth, async (c) => {
   try {
     const user = c.get('user');
-    const sql = getDb(c);
+    const rawSql = getDb(c);
+    const db = getDrizzle(c);
     const ipAddress = getClientIp(c);
 
     // Tier 3: ตรวจสอบสถานะ Timeout / Rate Limit ก่อนสร้างโพสต์
-    const timeoutStatus = await checkUserTimeoutStatus(sql, {
+    const timeoutStatus = await checkUserTimeoutStatus(rawSql, {
       userId: user.id,
       ipAddress,
     });
@@ -219,7 +219,7 @@ postRouter.post('/', requireAuth, async (c) => {
           await deleteFromR2(c, imgUrl);
 
           // Tier 3: บันทึก Audit Log
-          await recordModerationViolation(sql, {
+          await recordModerationViolation(rawSql, {
             userId: user.id,
             ipAddress,
             fileKey: null,
@@ -230,7 +230,7 @@ postRouter.post('/', requireAuth, async (c) => {
           });
 
           // Tier 3: ตรวจสอบว่าติดฟิลเตอร์เกิน 3 ครั้งใน 10 นาทีหรือยัง
-          const updatedTimeout = await checkUserTimeoutStatus(sql, {
+          const updatedTimeout = await checkUserTimeoutStatus(rawSql, {
             userId: user.id,
             ipAddress,
           });
@@ -272,44 +272,35 @@ postRouter.post('/', requireAuth, async (c) => {
       ? body.collaborators
       : [];
 
-    const inserted = await sql`
-      INSERT INTO posts (
-        user_id,
-        caption,
-        media_urls,
+    const inserted = await db
+      .insert(posts)
+      .values({
+        userId: user.id,
+        caption: textContent,
+        mediaUrls: imagesList,
         tags,
         collaborators,
-        likes_count,
-        comments_count,
-        shares_count,
-        views_count,
-        "createdAt",
-        "updatedAt"
-      ) VALUES (
-        ${user.id},
-        ${textContent},
-        ${JSON.stringify(imagesList)}::jsonb,
-        ${JSON.stringify(tags)}::jsonb,
-        ${JSON.stringify(collaborators)}::jsonb,
-        0,
-        0,
-        0,
-        0,
-        NOW(),
-        NOW()
-      )
-      RETURNING *
-    `;
+        likesCount: 0,
+        commentsCount: 0,
+        sharesCount: 0,
+        viewsCount: 0,
+      })
+      .returning();
 
     const newPost = inserted[0];
 
     // ดึงข้อมูล Author
-    const authors = await sql`
-      SELECT id, username, "displayName", "avatarUrl", bio
-      FROM users 
-      WHERE id = ${user.id}
-      LIMIT 1
-    `;
+    const authors = await db
+      .select({
+        id: users.id,
+        username: users.username,
+        displayName: users.displayName,
+        avatarUrl: users.avatarUrl,
+        bio: users.bio,
+      })
+      .from(users)
+      .where(eq(users.id, user.id))
+      .limit(1);
     const author = authors[0] || {};
 
     const formatted = {
@@ -330,9 +321,7 @@ postRouter.post('/', requireAuth, async (c) => {
         id: user.id,
         name: author.displayName || author.username || user.username,
         username: author.username || user.username,
-        avatar:
-          author.avatarUrl ||
-          'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=120&q=80',
+        avatar: author.avatarUrl || null,
         bio: author.bio || '',
       },
     };
@@ -364,40 +353,52 @@ postRouter.get('/:id', optionalAuth, async (c) => {
       return c.json({ success: false, message: 'Invalid post ID' }, 400);
     }
 
-    const sql = getDb(c);
+    const db = getDrizzle(c);
     const currentUser = c.get('user');
 
-    const posts = await sql`
-      SELECT 
-        p.*,
-        u.username as author_username,
-        u."displayName" as author_name,
-        u."avatarUrl" as author_avatar,
-        u.bio as author_bio,
-        ${
-          currentUser?.id
-            ? sql`EXISTS(SELECT 1 FROM post_likes pl WHERE pl.post_id = p.id AND pl.user_id = ${currentUser.id}) as is_liked`
-            : sql`false as is_liked`
-        }
-      FROM posts p
-      LEFT JOIN users u ON p.user_id = u.id
-      WHERE p.id = ${postId}
-      LIMIT 1
-    `;
+    const postRows = await db
+      .select({
+        id: posts.id,
+        userId: posts.userId,
+        caption: posts.caption,
+        mediaUrls: posts.mediaUrls,
+        tags: posts.tags,
+        collaborators: posts.collaborators,
+        likesCount: posts.likesCount,
+        commentsCount: posts.commentsCount,
+        sharesCount: posts.sharesCount,
+        viewsCount: posts.viewsCount,
+        createdAt: posts.createdAt,
+        updatedAt: posts.updatedAt,
+        authorUsername: users.username,
+        authorName: users.displayName,
+        authorAvatar: users.avatarUrl,
+        authorBio: users.bio,
+        isLiked: currentUser?.id
+          ? sql`EXISTS(SELECT 1 FROM post_likes pl WHERE pl.post_id = ${posts.id} AND pl.user_id = ${currentUser.id})`
+          : sql`false`,
+        isFollowingAuthor: currentUser?.id
+          ? sql`EXISTS(SELECT 1 FROM follows f WHERE f.follower_id = ${currentUser.id} AND f.following_id = ${posts.userId})`
+          : sql`false`,
+      })
+      .from(posts)
+      .leftJoin(users, eq(posts.userId, users.id))
+      .where(eq(posts.id, postId))
+      .limit(1);
 
-    if (posts.length === 0) {
+    if (postRows.length === 0) {
       return c.json({ success: false, message: 'Post not found' }, 404);
     }
 
-    const p = posts[0];
+    const p = postRows[0];
     let images = [];
-    if (Array.isArray(p.media_urls)) {
-      images = p.media_urls;
-    } else if (typeof p.media_urls === 'string') {
+    if (Array.isArray(p.mediaUrls)) {
+      images = p.mediaUrls;
+    } else if (typeof p.mediaUrls === 'string') {
       try {
-        images = JSON.parse(p.media_urls);
+        images = JSON.parse(p.mediaUrls);
       } catch {
-        images = [p.media_urls];
+        images = [p.mediaUrls];
       }
     }
 
@@ -410,18 +411,19 @@ postRouter.get('/:id', optionalAuth, async (c) => {
         images,
         media_urls: images,
         tags: Array.isArray(p.tags) ? p.tags : [],
-        likesCount: p.likes_count || 0,
-        commentsCount: p.comments_count || 0,
-        sharesCount: p.shares_count || 0,
-        isLiked: Boolean(p.is_liked),
+        likesCount: p.likesCount || 0,
+        commentsCount: p.commentsCount || 0,
+        sharesCount: p.sharesCount || 0,
+        isLiked: Boolean(p.isLiked),
         createdAt: p.createdAt,
         updatedAt: p.updatedAt,
         author: {
-          id: p.user_id,
-          name: p.author_name || p.author_username,
-          username: p.author_username,
-          avatar: p.author_avatar,
-          bio: p.author_bio,
+          id: p.userId,
+          name: p.authorName || p.authorUsername,
+          username: p.authorUsername,
+          avatar: p.authorAvatar,
+          bio: p.authorBio,
+          isFollowing: Boolean(p.isFollowingAuthor),
         },
       },
     });
@@ -438,17 +440,19 @@ postRouter.delete('/:id', requireAuth, async (c) => {
   try {
     const postId = parseInt(c.req.param('id'), 10);
     const user = c.get('user');
-    const sql = getDb(c);
+    const db = getDrizzle(c);
 
-    const posts = await sql`
-      SELECT id, user_id FROM posts WHERE id = ${postId} LIMIT 1
-    `;
+    const postRows = await db
+      .select({ id: posts.id, userId: posts.userId })
+      .from(posts)
+      .where(eq(posts.id, postId))
+      .limit(1);
 
-    if (posts.length === 0) {
+    if (postRows.length === 0) {
       return c.json({ success: false, message: 'Post not found' }, 404);
     }
 
-    if (posts[0].user_id !== user.id) {
+    if (postRows[0].userId !== user.id) {
       return c.json(
         { success: false, message: 'You are not authorized to delete this post' },
         403
@@ -456,10 +460,10 @@ postRouter.delete('/:id', requireAuth, async (c) => {
     }
 
     // ลบความชอบและความคิดเห็นที่เกี่ยวข้อง
-    await sql`DELETE FROM post_likes WHERE post_id = ${postId}`;
-    await sql`DELETE FROM post_comments WHERE post_id = ${postId}`;
-    await sql`DELETE FROM post_shares WHERE post_id = ${postId}`.catch(() => {});
-    await sql`DELETE FROM posts WHERE id = ${postId}`;
+    await db.delete(postLikes).where(eq(postLikes.postId, postId));
+    await db.delete(postComments).where(eq(postComments.postId, postId));
+    await db.delete(postShares).where(eq(postShares.postId, postId)).catch(() => {});
+    await db.delete(posts).where(eq(posts.id, postId));
 
     return c.json({ success: true, message: 'Post deleted successfully' });
   } catch (err) {
@@ -475,46 +479,54 @@ postRouter.post('/:id/like', requireAuth, async (c) => {
   try {
     const postId = parseInt(c.req.param('id'), 10);
     const user = c.get('user');
-    const sql = getDb(c);
+    const db = getDrizzle(c);
 
     // ตรวจสอบว่าเคยไลก์แล้วหรือยัง
-    const existing = await sql`
-      SELECT id FROM post_likes 
-      WHERE post_id = ${postId} AND user_id = ${user.id}
-      LIMIT 1
-    `;
+    const existing = await db
+      .select({ id: postLikes.id })
+      .from(postLikes)
+      .where(and(eq(postLikes.postId, postId), eq(postLikes.userId, user.id)))
+      .limit(1);
 
     let isLiked = false;
     if (existing.length > 0) {
       // Unlike
-      await sql`
-        DELETE FROM post_likes 
-        WHERE post_id = ${postId} AND user_id = ${user.id}
-      `;
-      await sql`
-        UPDATE posts 
-        SET likes_count = GREATEST(0, likes_count - 1), "updatedAt" = NOW() 
-        WHERE id = ${postId}
-      `;
+      await db
+        .delete(postLikes)
+        .where(and(eq(postLikes.postId, postId), eq(postLikes.userId, user.id)));
+      await db
+        .update(posts)
+        .set({
+          likesCount: sql`GREATEST(0, ${posts.likesCount} - 1)`,
+          updatedAt: sql`NOW()`,
+        })
+        .where(eq(posts.id, postId));
       isLiked = false;
     } else {
       // Like
-      await sql`
-        INSERT INTO post_likes (post_id, user_id, "createdAt") 
-        VALUES (${postId}, ${user.id}, NOW())
-      `;
-      await sql`
-        UPDATE posts 
-        SET likes_count = likes_count + 1, "updatedAt" = NOW() 
-        WHERE id = ${postId}
-      `;
+      await db.insert(postLikes).values({
+        postId,
+        userId: user.id,
+      });
+      await db
+        .update(posts)
+        .set({
+          likesCount: sql`${posts.likesCount} + 1`,
+          updatedAt: sql`NOW()`,
+        })
+        .where(eq(posts.id, postId));
       isLiked = true;
 
       // สร้างการแจ้งเตือน
-      const postOwnerRes = await sql`SELECT user_id, caption FROM posts WHERE id = ${postId} LIMIT 1`;
+      const postOwnerRes = await db
+        .select({ userId: posts.userId, caption: posts.caption })
+        .from(posts)
+        .where(eq(posts.id, postId))
+        .limit(1);
+
       if (postOwnerRes.length > 0) {
-        await createNotification(sql, {
-          userId: postOwnerRes[0].user_id,
+        await createNotification(db, {
+          userId: postOwnerRes[0].userId,
           actorId: user.id,
           type: 'like',
           entityId: postId,
@@ -525,10 +537,12 @@ postRouter.post('/:id/like', requireAuth, async (c) => {
     }
 
     // ดึงจำนวนไลก์ล่าสุด
-    const updated = await sql`
-      SELECT likes_count FROM posts WHERE id = ${postId} LIMIT 1
-    `;
-    const likesCount = updated[0]?.likes_count ?? 0;
+    const updated = await db
+      .select({ likesCount: posts.likesCount })
+      .from(posts)
+      .where(eq(posts.id, postId))
+      .limit(1);
+    const likesCount = updated[0]?.likesCount ?? 0;
 
     return c.json({
       success: true,
@@ -548,7 +562,8 @@ postRouter.post('/:id/share', optionalAuth, async (c) => {
   try {
     const postId = parseInt(c.req.param('id'), 10);
     const user = c.get('user');
-    const sql = getDb(c);
+    const rawSql = getDb(c);
+    const db = getDrizzle(c);
     const body = await c.req.json().catch(() => ({}));
     const platform = body.platform || 'link';
 
@@ -558,7 +573,7 @@ postRouter.post('/:id/share', optionalAuth, async (c) => {
 
     // 1. สร้างตาราง post_shares ถ้ายังไม่มี (สำหรับเก็บ Log การแชร์)
     try {
-      await sql`
+      await rawSql`
         CREATE TABLE IF NOT EXISTS post_shares (
           id SERIAL PRIMARY KEY,
           post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
@@ -573,27 +588,30 @@ postRouter.post('/:id/share', optionalAuth, async (c) => {
 
     // 2. บันทึก log การแชร์
     try {
-      await sql`
-        INSERT INTO post_shares (post_id, user_id, platform, "createdAt")
-        VALUES (${postId}, ${user?.id || null}, ${platform}, NOW())
-      `;
+      await db.insert(postShares).values({
+        postId,
+        userId: user?.id || null,
+        platform,
+      });
     } catch (insertErr) {
       console.warn('Insert post_shares warning:', insertErr.message);
     }
 
     // 3. เพิ่มจำนวน shares_count ในตาราง posts
-    const updated = await sql`
-      UPDATE posts 
-      SET shares_count = COALESCE(shares_count, 0) + 1, "updatedAt" = NOW() 
-      WHERE id = ${postId}
-      RETURNING shares_count
-    `;
+    const updated = await db
+      .update(posts)
+      .set({
+        sharesCount: sql`COALESCE(${posts.sharesCount}, 0) + 1`,
+        updatedAt: sql`NOW()`,
+      })
+      .where(eq(posts.id, postId))
+      .returning({ sharesCount: posts.sharesCount });
 
     if (updated.length === 0) {
       return c.json({ success: false, message: 'Post not found' }, 404);
     }
 
-    const sharesCount = updated[0]?.shares_count ?? 0;
+    const sharesCount = updated[0]?.sharesCount ?? 0;
 
     return c.json({
       success: true,
@@ -607,36 +625,36 @@ postRouter.post('/:id/share', optionalAuth, async (c) => {
 });
 
 /**
- * 6. GET /api/posts/:id/comments - ดึงความคิดเห็นของโพสต์
+ * 7. GET /api/posts/:id/comments - ดึงความคิดเห็นของโพสต์
  */
 postRouter.get('/:id/comments', async (c) => {
   try {
     const postId = parseInt(c.req.param('id'), 10);
-    const sql = getDb(c);
+    const db = getDrizzle(c);
 
-    const comments = await sql`
-      SELECT 
-        c.id,
-        c.content,
-        c.portfolio_attachment,
-        c."createdAt",
-        u.id as user_id,
-        u.username,
-        u."displayName",
-        u."avatarUrl"
-      FROM post_comments c
-      LEFT JOIN users u ON c.user_id = u.id
-      WHERE c.post_id = ${postId}
-      ORDER BY c."createdAt" ASC
-    `;
+    const commentList = await db
+      .select({
+        id: postComments.id,
+        content: postComments.content,
+        portfolioAttachment: postComments.portfolioAttachment,
+        createdAt: postComments.createdAt,
+        userId: users.id,
+        username: users.username,
+        displayName: users.displayName,
+        avatarUrl: users.avatarUrl,
+      })
+      .from(postComments)
+      .leftJoin(users, eq(postComments.userId, users.id))
+      .where(eq(postComments.postId, postId))
+      .orderBy(asc(postComments.createdAt));
 
-    const formatted = comments.map((cm) => ({
+    const formatted = commentList.map((cm) => ({
       id: cm.id,
       content: cm.content,
-      portfolioAttachment: cm.portfolio_attachment,
+      portfolioAttachment: cm.portfolioAttachment,
       createdAt: cm.createdAt,
       user: {
-        id: cm.user_id,
+        id: cm.userId,
         name: cm.displayName || cm.username,
         username: cm.username,
         avatar: cm.avatarUrl,
@@ -654,13 +672,13 @@ postRouter.get('/:id/comments', async (c) => {
 });
 
 /**
- * 7. POST /api/posts/:id/comments - เพิ่มความคิดเห็นใหม่
+ * 8. POST /api/posts/:id/comments - เพิ่มความคิดเห็นใหม่
  */
 postRouter.post('/:id/comments', requireAuth, async (c) => {
   try {
     const postId = parseInt(c.req.param('id'), 10);
     const user = c.get('user');
-    const sql = getDb(c);
+    const db = getDrizzle(c);
     const { content, attachPortfolio } = await c.req.json();
 
     if (!content || !content.trim()) {
@@ -672,24 +690,36 @@ postRouter.post('/:id/comments', requireAuth, async (c) => {
 
     let portfolioAttachment = null;
     if (attachPortfolio) {
-      const authorUsers = await sql`
-        SELECT id, username, "displayName", "avatarUrl", bio
-        FROM users WHERE id = ${user.id} LIMIT 1
-      `;
+      const authorUsers = await db
+        .select({
+          id: users.id,
+          username: users.username,
+          displayName: users.displayName,
+          avatarUrl: users.avatarUrl,
+          bio: users.bio,
+        })
+        .from(users)
+        .where(eq(users.id, user.id))
+        .limit(1);
       const authorUser = authorUsers[0] || {};
-      const authorShowcases = await sql`
-        SELECT id, title, cover_url, media_urls
-        FROM showcases
-        WHERE user_id = ${user.id} AND is_published = true
-        ORDER BY "createdAt" DESC
-        LIMIT 4
-      `;
-      const totalShowcasesResult = await sql`
-        SELECT COUNT(*)::int as count
-        FROM showcases
-        WHERE user_id = ${user.id} AND is_published = true
-      `;
-      const totalCount = totalShowcasesResult[0]?.count || authorShowcases.length;
+
+      const authorShowcases = await db
+        .select({
+          id: showcases.id,
+          title: showcases.title,
+          coverUrl: showcases.coverUrl,
+          mediaUrls: showcases.mediaUrls,
+        })
+        .from(showcases)
+        .where(and(eq(showcases.userId, user.id), eq(showcases.isPublished, true)))
+        .orderBy(desc(showcases.createdAt))
+        .limit(4);
+
+      const totalShowcasesResult = await db
+        .select({ count: count() })
+        .from(showcases)
+        .where(and(eq(showcases.userId, user.id), eq(showcases.isPublished, true)));
+      const totalCount = Number(totalShowcasesResult[0]?.count || authorShowcases.length);
 
       portfolioAttachment = {
         userId: authorUser.id,
@@ -701,42 +731,40 @@ postRouter.post('/:id/comments', requireAuth, async (c) => {
         showcases: authorShowcases.map((sc) => ({
           id: sc.id,
           title: sc.title,
-          coverUrl: sc.cover_url || (sc.media_urls?.[0] || ''),
+          coverUrl: sc.coverUrl || (Array.isArray(sc.mediaUrls) ? sc.mediaUrls[0] : ''),
         })),
       };
     }
 
-    const inserted = await sql`
-      INSERT INTO post_comments (
-        post_id,
-        user_id,
-        content,
-        portfolio_attachment,
-        "createdAt",
-        "updatedAt"
-      ) VALUES (
-        ${postId},
-        ${user.id},
-        ${content.trim()},
-        ${portfolioAttachment ? JSON.stringify(portfolioAttachment) : null},
-        NOW(),
-        NOW()
-      )
-      RETURNING *
-    `;
+    const inserted = await db
+      .insert(postComments)
+      .values({
+        postId,
+        userId: user.id,
+        content: content.trim(),
+        portfolioAttachment,
+      })
+      .returning();
 
     // เพิ่ม comment count ในโพสต์
-    await sql`
-      UPDATE posts 
-      SET comments_count = comments_count + 1, "updatedAt" = NOW() 
-      WHERE id = ${postId}
-    `;
+    await db
+      .update(posts)
+      .set({
+        commentsCount: sql`${posts.commentsCount} + 1`,
+        updatedAt: sql`NOW()`,
+      })
+      .where(eq(posts.id, postId));
 
     // สร้างการแจ้งเตือนสำหรับเจ้าของโพสต์
-    const postOwnerRes = await sql`SELECT user_id FROM posts WHERE id = ${postId} LIMIT 1`;
+    const postOwnerRes = await db
+      .select({ userId: posts.userId })
+      .from(posts)
+      .where(eq(posts.id, postId))
+      .limit(1);
+
     if (postOwnerRes.length > 0) {
-      await createNotification(sql, {
-        userId: postOwnerRes[0].user_id,
+      await createNotification(db, {
+        userId: postOwnerRes[0].userId,
         actorId: user.id,
         type: 'comment',
         entityId: postId,
@@ -746,10 +774,15 @@ postRouter.post('/:id/comments', requireAuth, async (c) => {
     }
 
     // ดึงข้อมูล Author
-    const authors = await sql`
-      SELECT username, "displayName", "avatarUrl" 
-      FROM users WHERE id = ${user.id} LIMIT 1
-    `;
+    const authors = await db
+      .select({
+        username: users.username,
+        displayName: users.displayName,
+        avatarUrl: users.avatarUrl,
+      })
+      .from(users)
+      .where(eq(users.id, user.id))
+      .limit(1);
     const author = authors[0] || {};
 
     const comment = inserted[0];
@@ -759,7 +792,7 @@ postRouter.post('/:id/comments', requireAuth, async (c) => {
         comment: {
           id: comment.id,
           content: comment.content,
-          portfolioAttachment: comment.portfolio_attachment,
+          portfolioAttachment: comment.portfolioAttachment,
           createdAt: comment.createdAt,
           user: {
             id: user.id,
@@ -778,30 +811,39 @@ postRouter.post('/:id/comments', requireAuth, async (c) => {
 });
 
 /**
- * 8. DELETE /api/posts/:postId/comments/:commentId - ลบความคิดเห็น
+ * 9. DELETE /api/posts/:postId/comments/:commentId - ลบความคิดเห็น
  */
 postRouter.delete('/:postId/comments/:commentId', requireAuth, async (c) => {
   try {
     const postId = parseInt(c.req.param('postId'), 10);
     const commentId = parseInt(c.req.param('commentId'), 10);
     const user = c.get('user');
-    const sql = getDb(c);
+    const db = getDrizzle(c);
 
-    const deleted = await sql`
-      DELETE FROM post_comments 
-      WHERE id = ${commentId} AND (user_id = ${user.id} OR EXISTS(SELECT 1 FROM posts WHERE id = ${postId} AND user_id = ${user.id}))
-      RETURNING id
-    `;
+    const deleted = await db
+      .delete(postComments)
+      .where(
+        and(
+          eq(postComments.id, commentId),
+          or(
+            eq(postComments.userId, user.id),
+            sql`EXISTS(SELECT 1 FROM posts WHERE id = ${postId} AND user_id = ${user.id})`
+          )
+        )
+      )
+      .returning({ id: postComments.id });
 
     if (deleted.length === 0) {
       return c.json({ success: false, message: 'Comment not found or unauthorized' }, 404);
     }
 
-    await sql`
-      UPDATE posts 
-      SET comments_count = GREATEST(0, comments_count - 1), "updatedAt" = NOW() 
-      WHERE id = ${postId}
-    `;
+    await db
+      .update(posts)
+      .set({
+        commentsCount: sql`GREATEST(0, ${posts.commentsCount} - 1)`,
+        updatedAt: sql`NOW()`,
+      })
+      .where(eq(posts.id, postId));
 
     return c.json({ success: true, message: 'Comment deleted successfully' });
   } catch (err) {
@@ -811,4 +853,3 @@ postRouter.delete('/:postId/comments/:commentId', requireAuth, async (c) => {
 });
 
 export default postRouter;
-
