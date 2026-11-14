@@ -512,7 +512,7 @@ auth.get("/google/callback", async (c) => {
     );
 
     return c.redirect(
-      `${clientUrl}/sign-in?token=${session.token}&user=${userParam}`,
+      `${clientUrl}/?token=${session.token}&user=${userParam}`,
     );
   } catch (err) {
     console.error("Google OAuth callback error:", err);
