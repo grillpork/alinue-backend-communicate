@@ -1,39 +1,45 @@
+import { neon } from "@neondatabase/serverless";
+import { drizzle as drizzleNeon } from "drizzle-orm/neon-http";
 import postgres from "postgres";
-import { drizzle } from "drizzle-orm/postgres-js";
+import { drizzle as drizzlePostgres } from "drizzle-orm/postgres-js";
 import * as schema from "../db/schema.js";
 import * as relations from "../db/relations.js";
 
 const fullSchema = { ...schema, ...relations };
-
-let hasLoggedConnection = false;
-
-function parseDbInfo(connectionString) {
-  try {
-    const u = new URL(connectionString);
-    const dbName = u.pathname.replace(/^\//, "").split("?")[0];
-    return { host: u.host, dbName, user: u.username };
-  } catch {
-    return { host: "unknown", dbName: "", user: "" };
-  }
-}
 
 function cleanDatabaseUrl(rawUrl) {
   return String(rawUrl).replace(/['"]/g, "").trim();
 }
 
 let cachedClient = null;
+let cachedUrl = null;
 
-function createPostgresClient(connectionString) {
-  if (cachedClient) return cachedClient;
+function createClient(connectionString) {
+  if (cachedClient && cachedUrl === connectionString) {
+    return cachedClient;
+  }
 
-  const sql = postgres(connectionString, {
-    max: 10,
-    idle_timeout: 20,
-    connect_timeout: 10,
-  });
-  const db = drizzle(sql, { schema: fullSchema });
-  cachedClient = { sql, db };
-  return cachedClient;
+  const isNeon = connectionString.includes("neon.tech");
+
+  if (isNeon) {
+    const sql = neon(connectionString);
+    const db = drizzleNeon(sql, { schema: fullSchema });
+    sql.db = db;
+    cachedClient = { sql, db };
+    cachedUrl = connectionString;
+    return cachedClient;
+  } else {
+    const sql = postgres(connectionString, {
+      max: 1, // Single connection for serverless safety
+      idle_timeout: 5,
+      connect_timeout: 10,
+    });
+    const db = drizzlePostgres(sql, { schema: fullSchema });
+    sql.db = db;
+    cachedClient = { sql, db };
+    cachedUrl = connectionString;
+    return cachedClient;
+  }
 }
 
 export function getDb(c) {
@@ -45,37 +51,18 @@ export function getDb(c) {
   }
 
   const connectionString = cleanDatabaseUrl(rawUrl);
-  const { sql, db } = createPostgresClient(connectionString);
-
-  if (!hasLoggedConnection) {
-    const info = parseDbInfo(connectionString);
-    hasLoggedConnection = true;
-
-    // Ping ทดสอบการเชื่อมต่อจริงและแสดง Log
-    Promise.resolve()
-      .then(async () => {
-        const start = Date.now();
-        await sql`SELECT 1`;
-        const latency = Date.now() - start;
-        console.log(
-          `✅ [Database] Connected successfully to VPS PostgreSQL! [Host: ${info.host}] [DB: ${info.dbName}] (${latency}ms)`
-        );
-      })
-      .catch((err) => {
-        console.error(
-          `❌ [Database] Connection failed [Host: ${info.host}] [DB: ${info.dbName}]:`,
-          err.message
-        );
-      });
-  }
-
-  sql.db = db;
-  return sql;
+  const client = createClient(connectionString);
+  return client.sql;
 }
 
 export function getDrizzle(c) {
-  const sql = getDb(c);
-  return sql.db;
+  const rawUrl = c?.env?.DATABASE_URL || process.env.DATABASE_URL;
+  if (!rawUrl) {
+    throw new Error("DATABASE_URL is not configured in environment variables");
+  }
+  const connectionString = cleanDatabaseUrl(rawUrl);
+  const client = createClient(connectionString);
+  return client.db;
 }
 
 export { schema, relations };

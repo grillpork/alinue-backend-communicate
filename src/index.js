@@ -53,20 +53,6 @@ app.use('*', async (c, next) => {
   await next();
 });
 
-// Database Warmup Middleware (เรียก getDb เพื่อ trigger connection log ใน Request แรก)
-let isDbWarmupDone = false;
-app.use('*', async (c, next) => {
-  if (!isDbWarmupDone) {
-    try {
-      getDb(c);
-      isDbWarmupDone = true;
-    } catch (err) {
-      console.error('❌ [Database] Initialization failed:', err.message);
-    }
-  }
-  await next();
-});
-
 // Root / Health Check
 app.get('/', (c) => {
   return c.json({
