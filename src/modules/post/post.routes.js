@@ -34,12 +34,15 @@ postRouter.get('/', optionalAuth, async (c) => {
     if (tag) conditions.push(sql`${posts.tags} ? ${tag}`);
     if (userId) conditions.push(eq(posts.userId, parseInt(userId, 10)));
     if (search) {
-      const searchPattern = `%${search}%`;
+      const cleanSearch = search.trim().replace(/^#/, '');
+      const searchPattern = `%${cleanSearch}%`;
       conditions.push(
         or(
+          ilike(posts.caption, `%${search.trim()}%`),
           ilike(posts.caption, searchPattern),
           ilike(users.displayName, searchPattern),
-          ilike(users.username, searchPattern)
+          ilike(users.username, searchPattern),
+          sql`EXISTS (SELECT 1 FROM jsonb_array_elements_text(${posts.tags}) t WHERE t ILIKE ${searchPattern})`
         )
       );
     }
