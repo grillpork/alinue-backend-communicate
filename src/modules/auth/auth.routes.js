@@ -1,16 +1,116 @@
 import { Hono } from "hono";
-import { setCookie, deleteCookie } from "hono/cookie";
+import { setCookie, deleteCookie, getCookie } from "hono/cookie";
 import bcrypt from "bcryptjs";
 import { getDrizzle } from "../../config/db.js";
 import { users, sessions, accounts } from "../../db/schema.js";
-import { eq, or, sql } from "drizzle-orm";
+import { eq, or, ilike, sql } from "drizzle-orm";
 import {
   requireAuth,
   createDbSession,
   extractToken,
+  getUserServiceQuota,
 } from "../../middleware/auth.js";
+import { createNotification } from "../notification/notification.service.js";
 
 const auth = new Hono();
+
+/**
+ * Helper: ให้สิทธิ์โพสต์ Service เพิ่มจาก 1 เป็นสูงสุด 2 โพสต์ ทั้งคนชวน (Inviter) และคนถูกชวน (Invitee)
+ */
+async function applyMutualReferral(db, newUser, rawRef) {
+  const cleanRef = String(rawRef || "")
+    .trim()
+    .replace(/^@/, "")
+    .toLowerCase();
+  if (!cleanRef || !newUser?.id) return false;
+
+  try {
+    const refAsNumber = parseInt(cleanRef, 10);
+    const inviterRows = await db
+      .select({
+        id: users.id,
+        username: users.username,
+        preferences: users.preferences,
+      })
+      .from(users)
+      .where(
+        !isNaN(refAsNumber) && String(refAsNumber) === cleanRef
+          ? or(eq(users.id, refAsNumber), ilike(users.username, cleanRef))
+          : ilike(users.username, cleanRef),
+      )
+      .limit(1);
+
+    if (inviterRows.length === 0) return false;
+    const inviter = inviterRows[0];
+
+    // ห้ามชวนตัวเอง
+    if (String(inviter.id) === String(newUser.id)) return false;
+
+    const inviterPrefs =
+      inviter.preferences && typeof inviter.preferences === "object"
+        ? inviter.preferences
+        : {};
+    const newUserPrefs =
+      newUser.preferences && typeof newUser.preferences === "object"
+        ? newUser.preferences
+        : {};
+
+    // หากผู้ใช้นี้เคยรับสิทธิ์จากคนอื่นไปแล้ว ไม่ต้องซ้ำ
+    if (newUserPrefs.referredBy) return false;
+
+    const nowIso = new Date().toISOString();
+
+    // 1. อัปเดตสิทธิ์ให้คนถูกชวน (Invitee): เพิ่มเป็นสูงสุด 2 โพสต์
+    const updatedNewUserPrefs = {
+      ...newUserPrefs,
+      serviceQuotaBonus: true,
+      maxServicePosts: 2,
+      referredBy: inviter.username,
+      referredById: inviter.id,
+      referredAt: nowIso,
+    };
+
+    await db
+      .update(users)
+      .set({
+        preferences: updatedNewUserPrefs,
+        updatedAt: sql`NOW()`,
+      })
+      .where(eq(users.id, newUser.id));
+
+    // 2. อัปเดตสิทธิ์ให้คนชวน (Inviter): เพิ่มเป็นสูงสุด 2 โพสต์
+    const updatedInviterPrefs = {
+      ...inviterPrefs,
+      serviceQuotaBonus: true,
+      maxServicePosts: 2,
+      referralCount: (Number(inviterPrefs.referralCount) || 0) + 1,
+      lastReferredUsername: newUser.username,
+      lastReferralAt: nowIso,
+    };
+
+    await db
+      .update(users)
+      .set({
+        preferences: updatedInviterPrefs,
+        updatedAt: sql`NOW()`,
+      })
+      .where(eq(users.id, inviter.id));
+
+    // 3. แจ้งเตือนคนชวนว่าเพื่อนสมัครสำเร็จและปลดล็อกโควตา 2 โพสต์แล้ว
+    await createNotification(db, {
+      userId: inviter.id,
+      actorId: newUser.id,
+      type: "follow",
+      message:
+        "สมัครสมาชิกผ่านคำเชิญของคุณ! คุณและเพื่อนได้รับสิทธิ์โพสต์รับงานเพิ่มเป็นสูงสุด 2 โพสต์แล้ว 🎉",
+    });
+
+    return true;
+  } catch (err) {
+    console.warn("applyMutualReferral warning:", err.message);
+    return false;
+  }
+}
 
 /**
  * Helper ดึง Google OAuth Config
@@ -68,7 +168,7 @@ auth.post("/sign-up", async (c) => {
   try {
     const db = getDrizzle(c);
     const body = await c.req.json();
-    const { email, password, username, name } = body;
+    const { email, password, username, name, ref, referredBy } = body;
 
     if (!email || !password) {
       return c.json(
@@ -134,11 +234,20 @@ auth.post("/sign-up", async (c) => {
         username: users.username,
         displayName: users.displayName,
         avatarUrl: users.avatarUrl,
+        preferences: users.preferences,
         createdAt: users.createdAt,
       });
 
     const user = inserted[0];
-    
+
+    // หากสมัครผ่านลิงก์ชวนเพื่อน (ref / referredBy) ให้ปลดล็อกโควตา Service เป็น 2 โพสต์ทั้งสองฝ่าย
+    const rawReferral = ref || referredBy || getCookie(c, "alinue_ref");
+    let referralApplied = false;
+    if (rawReferral) {
+      referralApplied = await applyMutualReferral(db, user, rawReferral);
+      deleteCookie(c, "alinue_ref", { path: "/" });
+    }
+
     // สร้าง Session ลงในฐานข้อมูล Neon DB ตาราง sessions
     const session = await createDbSession(db, user.id, c);
 
@@ -158,7 +267,12 @@ auth.post("/sign-up", async (c) => {
         success: true,
         message: "User registered successfully",
         token: session.token,
-        user,
+        referralApplied,
+        user: {
+          ...user,
+          serviceQuota: referralApplied ? 2 : 1,
+          isReferralUnlocked: referralApplied,
+        },
       },
       201,
     );
@@ -289,6 +403,7 @@ auth.get("/me", requireAuth, async (c) => {
         banner: users.banner,
         website: users.website,
         socialLinks: users.socialLinks,
+        preferences: users.preferences,
         createdAt: users.createdAt,
       })
       .from(users)
@@ -299,12 +414,71 @@ auth.get("/me", requireAuth, async (c) => {
       return c.json({ success: false, message: "User not found" }, 404);
     }
 
+    const u = userList[0];
+    const quotaInfo = getUserServiceQuota(u.preferences);
+
     return c.json({
       success: true,
-      user: userList[0],
+      user: {
+        ...u,
+        serviceQuota: quotaInfo.maxServicePosts,
+        isReferralUnlocked: quotaInfo.isReferralUnlocked,
+        referralCount: quotaInfo.referralCount,
+        referredBy: quotaInfo.referredBy,
+      },
     });
   } catch (err) {
     console.error("Get /me error:", err);
+    return c.json({ success: false, message: "Server error" }, 500);
+  }
+});
+
+/**
+ * 3.1 POST /api/auth/claim-referral - รับสิทธิ์จากการชวนเพื่อน (สำหรับผู้ใช้ใหม่หรือหลัง Google Login)
+ */
+auth.post("/claim-referral", requireAuth, async (c) => {
+  try {
+    const authUser = c.get("user");
+    const db = getDrizzle(c);
+    const body = await c.req.json().catch(() => ({}));
+    const rawRef = body.ref || body.referredBy;
+
+    if (!rawRef) {
+      return c.json(
+        { success: false, message: "กรุณาระบุรหัสผู้แนะนำ (ref)" },
+        400,
+      );
+    }
+
+    const userRows = await db
+      .select({
+        id: users.id,
+        username: users.username,
+        preferences: users.preferences,
+      })
+      .from(users)
+      .where(eq(users.id, authUser.id))
+      .limit(1);
+
+    if (userRows.length === 0) {
+      return c.json({ success: false, message: "User not found" }, 404);
+    }
+
+    const currentUser = userRows[0];
+    const applied = await applyMutualReferral(db, currentUser, rawRef);
+
+    return c.json({
+      success: true,
+      applied,
+      serviceQuota: applied
+        ? 2
+        : getUserServiceQuota(currentUser.preferences).maxServicePosts,
+      message: applied
+        ? "ปลดล็อกสิทธิ์โพสต์รับงานสูงสุด 2 โพสต์เรียบร้อยแล้ว!"
+        : "ไม่สามารถใช้รหัสแนะนำนี้ได้ หรือคุณได้รับสิทธิ์ไปแล้ว",
+    });
+  } catch (err) {
+    console.error("Claim referral error:", err);
     return c.json({ success: false, message: "Server error" }, 500);
   }
 });
@@ -331,6 +505,7 @@ auth.post("/sign-out", async (c) => {
  */
 auth.get("/google", (c) => {
   const { clientId, redirectUri } = getGoogleConfig(c);
+  const ref = (c.req.query("ref") || "").trim();
 
   if (!clientId) {
     return c.json(
@@ -343,7 +518,20 @@ auth.get("/google", (c) => {
     );
   }
 
-  const state = Math.random().toString(36).substring(7);
+  const nonce = Math.random().toString(36).substring(7);
+  const state = ref ? `ref:${ref}:${nonce}` : nonce;
+
+  if (ref) {
+    const isLocalhost =
+      c.req.url.includes("localhost") || c.req.url.includes("127.0.0.1");
+    setCookie(c, "alinue_ref", ref, {
+      path: "/",
+      secure: !isLocalhost,
+      httpOnly: false,
+      maxAge: 60 * 30,
+      sameSite: "Lax",
+    });
+  }
 
   const googleAuthUrl = new URL(
     "https://accounts.google.com/o/oauth2/v2/auth",
@@ -375,6 +563,14 @@ auth.get("/google/callback", async (c) => {
     getGoogleConfig(c);
   const code = c.req.query("code");
   const error = c.req.query("error");
+  const state = c.req.query("state") || "";
+
+  let refFromState = null;
+  if (state.startsWith("ref:")) {
+    const parts = state.split(":");
+    if (parts[1]) refFromState = parts[1];
+  }
+  const referralCode = refFromState || getCookie(c, "alinue_ref") || null;
 
   if (error || !code) {
     return c.redirect(
@@ -431,6 +627,7 @@ auth.get("/google/callback", async (c) => {
         username: users.username,
         displayName: users.displayName,
         avatarUrl: users.avatarUrl,
+        preferences: users.preferences,
       })
       .from(users)
       .where(eq(users.email, cleanEmail))
@@ -469,8 +666,14 @@ auth.get("/google/callback", async (c) => {
           username: users.username,
           displayName: users.displayName,
           avatarUrl: users.avatarUrl,
+          preferences: users.preferences,
         });
       user = inserted[0];
+
+      if (referralCode) {
+        await applyMutualReferral(db, user, referralCode);
+        deleteCookie(c, "alinue_ref", { path: "/" });
+      }
 
       // บันทึกความเชื่อมโยงใน accounts table
       const accountId = `acc_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;

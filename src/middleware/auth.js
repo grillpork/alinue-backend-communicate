@@ -29,6 +29,23 @@ export function extractToken(c) {
   return getCookie(c, 'auth_token') || null;
 }
 
+export function getUserServiceQuota(preferences) {
+  const prefs =
+    preferences && typeof preferences === 'object' ? preferences : {};
+  const isUnlocked = Boolean(
+    prefs.serviceQuotaBonus ||
+      prefs.referredBy ||
+      Number(prefs.referralCount) >= 1 ||
+      Number(prefs.maxServicePosts) >= 2
+  );
+  return {
+    maxServicePosts: isUnlocked ? 2 : 1,
+    isReferralUnlocked: isUnlocked,
+    referredBy: prefs.referredBy || null,
+    referralCount: Number(prefs.referralCount) || 0,
+  };
+}
+
 /**
  * ตรวจสอบ Session จากฐานข้อมูล Neon DB (ตาราง sessions) เป็นหลัก
  */
@@ -54,6 +71,7 @@ export async function getSessionUser(c) {
         location: users.location,
         banner: users.banner,
         website: users.website,
+        preferences: users.preferences,
         isBanned: users.isBanned,
       })
       .from(sessions)
@@ -83,6 +101,7 @@ export async function getSessionUser(c) {
             location: users.location,
             banner: users.banner,
             website: users.website,
+            preferences: users.preferences,
             isBanned: users.isBanned,
           })
           .from(users)

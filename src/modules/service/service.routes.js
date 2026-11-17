@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { getDrizzle, getDb } from '../../config/db.js';
 import { services, serviceLikes, users, searchLogs } from '../../db/schema.js';
-import { requireAuth, optionalAuth } from '../../middleware/auth.js';
+import { requireAuth, optionalAuth, getUserServiceQuota } from '../../middleware/auth.js';
 import {
   checkImageUrl,
   deleteFromR2,
@@ -10,7 +10,7 @@ import {
   getClientIp,
 } from '../../utils/moderation.js';
 import { createNotification } from '../notification/notification.service.js';
-import { eq, and, or, ilike, sql, desc, gt, lte } from 'drizzle-orm';
+import { eq, and, or, ilike, sql, desc, gt, lte, count } from 'drizzle-orm';
 
 const serviceRouter = new Hono();
 
@@ -168,9 +168,6 @@ serviceRouter.get('/', optionalAuth, async (c) => {
         priceText: s.priceText || null,
         startPrice: s.startPrice ? Number(s.startPrice) : null,
         endPrice: s.endPrice ? Number(s.endPrice) : null,
-        priceText: s.priceText || null,
-        startPrice: s.startPrice ? Number(s.startPrice) : null,
-        endPrice: s.endPrice ? Number(s.endPrice) : null,
         status: isExpired ? 'expired' : s.status,
         expiresAt: s.expiresAt,
         isExpired,
@@ -288,6 +285,8 @@ serviceRouter.get('/my', requireAuth, async (c) => {
       };
     });
 
+    const quotaInfo = getUserServiceQuota(user.preferences);
+
     return c.json({
       success: true,
       services: formatted,
@@ -296,6 +295,15 @@ serviceRouter.get('/my', requireAuth, async (c) => {
         active: activeCount,
         expired: expiredCount,
         paused: pausedCount,
+      },
+      quota: {
+        used: formatted.length,
+        max: quotaInfo.maxServicePosts,
+        remaining: Math.max(0, quotaInfo.maxServicePosts - formatted.length),
+        isReferralUnlocked: quotaInfo.isReferralUnlocked,
+        referralCount: quotaInfo.referralCount,
+        referredBy: quotaInfo.referredBy,
+        canCreate: formatted.length < quotaInfo.maxServicePosts,
       },
     });
   } catch (err) {
@@ -385,9 +393,6 @@ serviceRouter.get('/:id', optionalAuth, async (c) => {
         priceText: s.priceText || null,
         startPrice: s.startPrice ? Number(s.startPrice) : null,
         endPrice: s.endPrice ? Number(s.endPrice) : null,
-        priceText: s.priceText || null,
-        startPrice: s.startPrice ? Number(s.startPrice) : null,
-        endPrice: s.endPrice ? Number(s.endPrice) : null,
         status: isExpired ? 'expired' : s.status,
         expiresAt: s.expiresAt,
         isExpired,
@@ -429,6 +434,51 @@ serviceRouter.post('/', requireAuth, async (c) => {
     const rawSql = getDb(c);
     const db = getDrizzle(c);
     const ipAddress = getClientIp(c);
+
+    // ตรวจสอบโควตาการโพสต์รับงาน (ปกติสูงสุด 1 โพสต์ หากชวนเพื่อนหรือถูกเพื่อนชวนจะได้เพิ่มเป็นสูงสุด 2 โพสต์)
+    const [existingServicesCountRes, userPrefRows] = await Promise.all([
+      db
+        .select({ count: count() })
+        .from(services)
+        .where(eq(services.userId, user.id)),
+      db
+        .select({ preferences: users.preferences })
+        .from(users)
+        .where(eq(users.id, user.id))
+        .limit(1),
+    ]);
+
+    const currentServicesCount = Number(existingServicesCountRes[0]?.count || 0);
+    const freshPrefs = userPrefRows[0]?.preferences ?? user.preferences;
+    const quotaInfo = getUserServiceQuota(freshPrefs);
+    const maxQuota = quotaInfo.maxServicePosts;
+
+    if (currentServicesCount >= maxQuota) {
+      if (maxQuota === 1) {
+        return c.json(
+          {
+            success: false,
+            code: 'QUOTA_LIMIT_NEED_REFERRAL',
+            currentCount: currentServicesCount,
+            maxQuota: 1,
+            message:
+              'คุณใช้โควตาโพสต์รับงานครบ 1/1 โพสต์แล้ว! แชร์ลิงก์ชวนเพื่อนมาสมัครสมาชิกเพื่อปลดล็อกเพิ่มเป็นสูงสุด 2 โพสต์ (ได้ทั้งคุณและเพื่อน)',
+          },
+          403
+        );
+      }
+      return c.json(
+        {
+          success: false,
+          code: 'QUOTA_MAX_REACHED',
+          currentCount: currentServicesCount,
+          maxQuota: 2,
+          message:
+            'คุณใช้โควตาโพสต์รับงานครบสูงสุด 2/2 โพสต์แล้ว กรุณาแก้ไขโพสต์เดิมหรือลบโพสต์เก่าก่อนสร้างใหม่',
+        },
+        403
+      );
+    }
 
     // ตรวจสอบ Timeout / Rate Limit
     const timeoutStatus = await checkUserTimeoutStatus(rawSql, {
@@ -495,7 +545,7 @@ serviceRouter.post('/', requireAuth, async (c) => {
         if (!check.isSafe) {
           const fileKey = imgUrl.replace(`${r2Config.publicUrl}/`, '').replace(/^https?:\/\/[^/]+\//, '');
           if (fileKey) {
-            await deleteFromR2(fileKey, r2Config);
+            await deleteFromR2(c, imgUrl);
           }
           await recordModerationViolation(rawSql, {
             userId: user.id,
