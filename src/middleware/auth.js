@@ -35,14 +35,20 @@ export function getUserServiceQuota(preferences) {
   const isUnlocked = Boolean(
     prefs.serviceQuotaBonus ||
       prefs.referredBy ||
+      prefs.inviteCodeUsed ||
       Number(prefs.referralCount) >= 1 ||
       Number(prefs.maxServicePosts) >= 2
   );
+  const inviteCodeUsed = Boolean(prefs.inviteCodeUsed);
   return {
     maxServicePosts: isUnlocked ? 2 : 1,
     isReferralUnlocked: isUnlocked,
     referredBy: prefs.referredBy || null,
     referralCount: Number(prefs.referralCount) || 0,
+    inviteCode: prefs.inviteCode || null,
+    inviteCodeUsed,
+    inviteCodeUsedBy: prefs.inviteCodeUsedBy || null,
+    inviteRemainingUses: inviteCodeUsed ? 0 : 1,
   };
 }
 

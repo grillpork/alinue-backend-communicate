@@ -15,36 +15,147 @@ import { createNotification } from "../notification/notification.service.js";
 const auth = new Hono();
 
 /**
+ * ชุดคำ 4 ตัวอักษรอ่านง่ายสำหรับสร้าง One-Time Invite Code รูปแบบ WORD-WORD-WORD (เช่น TANK-HEAL-ABLE)
+ */
+const INVITE_WORDS = [
+  "ABLE", "APEX", "ARTS", "AURA", "BEAM", "BLUE", "BOLD", "CALM", "CAST", "CORE",
+  "CYAN", "DASH", "DAWN", "DRAW", "DUSK", "ECHO", "EDGE", "EPIC", "FADE", "FAST",
+  "FINE", "FLOW", "FLUX", "FORM", "FREE", "GALE", "GLOW", "GOLD", "GRID", "HALO",
+  "HEAL", "HERO", "HUES", "ICON", "IDEA", "INKY", "JADE", "JAZZ", "JUMP", "KEEN",
+  "KIND", "KITE", "LARK", "LEAF", "LENS", "LILY", "LINE", "LINK", "LUCK", "LUNA",
+  "LUSH", "LYRE", "MADE", "MAGE", "MASK", "MINT", "MIST", "MODE", "MOON", "MUSE",
+  "NEON", "NEXT", "NODE", "NOIR", "NOVA", "OPAL", "PACE", "PAGE", "PALM", "PEAK",
+  "PINE", "PLAY", "PLUM", "PLUS", "POEM", "PURE", "QUAD", "QUIZ", "RAIN", "RARE",
+  "RAYS", "REAL", "REED", "RIFT", "RISE", "ROSE", "RUBY", "RUNE", "RUSH", "SAGE",
+  "SAND", "SEAL", "SEED", "SILK", "SKIP", "SOAR", "SOFT", "SOLO", "SONG", "SOUL",
+  "SPIN", "STAR", "STEP", "SYNC", "TALE", "TANK", "TEAL", "TIDE", "TILE", "TIME",
+  "TINT", "TONE", "TRUE", "TUNE", "VAST", "VEIL", "VIBE", "VIEW", "VINE", "VIVA",
+  "VOID", "WARM", "WAVE", "WILD", "WIND", "WING", "WISE", "WISH", "WOOD", "WORK",
+  "WRIT", "YARN", "ZEAL", "ZERO", "ZEST", "ZINC", "ZONE", "ZOOM",
+];
+
+function generateReadableInviteCode() {
+  const pick = () =>
+    INVITE_WORDS[Math.floor(Math.random() * INVITE_WORDS.length)];
+  return `${pick()}-${pick()}-${pick()}`;
+}
+
+function normalizeInviteCode(raw) {
+  return String(raw || "")
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, "")
+    .replace(/^@/, "");
+}
+
+/**
+ * ตรวจสอบว่าผู้ใช้มี One-Time Invite Code แล้วหรือยัง หากยังไม่มีให้สร้างและบันทึกลง preferences
+ */
+async function ensureUserInviteCode(db, user) {
+  const prefs =
+    user?.preferences && typeof user.preferences === "object"
+      ? user.preferences
+      : {};
+
+  if (prefs.inviteCode) {
+    return prefs;
+  }
+
+  let generatedCode = generateReadableInviteCode();
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const existing = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(sql`UPPER(${users.preferences}->>'inviteCode') = ${generatedCode}`)
+      .limit(1);
+    if (existing.length === 0) break;
+    generatedCode = generateReadableInviteCode();
+  }
+
+  const updatedPrefs = {
+    ...prefs,
+    inviteCode: generatedCode,
+    inviteCodeUsed: Boolean(prefs.inviteCodeUsed),
+    inviteCodeCreatedAt: new Date().toISOString(),
+  };
+
+  await db
+    .update(users)
+    .set({
+      preferences: updatedPrefs,
+      updatedAt: sql`NOW()`,
+    })
+    .where(eq(users.id, user.id));
+
+  return updatedPrefs;
+}
+
+/**
  * Helper: ให้สิทธิ์โพสต์ Service เพิ่มจาก 1 เป็นสูงสุด 2 โพสต์ ทั้งคนชวน (Inviter) และคนถูกชวน (Invitee)
+ * รองรับ One-Time Invite Code (XXXX-XXXX-XXXX) ที่ใช้ได้เพียง 1 ครั้งเท่านั้น
  */
 async function applyMutualReferral(db, newUser, rawRef) {
-  const cleanRef = String(rawRef || "")
-    .trim()
-    .replace(/^@/, "")
-    .toLowerCase();
-  if (!cleanRef || !newUser?.id) return false;
+  const cleanRaw = String(rawRef || "").trim();
+  if (!cleanRaw || !newUser?.id) {
+    return { applied: false, reason: "invalid_code", message: "กรุณาระบุโค้ดคำเชิญ" };
+  }
+
+  const upperCode = normalizeInviteCode(cleanRaw);
+  const looksLikeCode = /^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(upperCode);
 
   try {
-    const refAsNumber = parseInt(cleanRef, 10);
-    const inviterRows = await db
+    // 1. ค้นหาจาก One-Time Invite Code ก่อนเสมอ
+    let inviterRows = await db
       .select({
         id: users.id,
         username: users.username,
+        displayName: users.displayName,
         preferences: users.preferences,
       })
       .from(users)
-      .where(
-        !isNaN(refAsNumber) && String(refAsNumber) === cleanRef
-          ? or(eq(users.id, refAsNumber), ilike(users.username, cleanRef))
-          : ilike(users.username, cleanRef),
-      )
+      .where(sql`UPPER(${users.preferences}->>'inviteCode') = ${upperCode}`)
       .limit(1);
 
-    if (inviterRows.length === 0) return false;
+    let matchedByOneTimeCode = inviterRows.length > 0;
+
+    // 2. Fallback รองรับลิงก์ ref แบบเก่า (username / id) เฉพาะกรณีที่ไม่ใช่รูปแบบโค้ด XXXX-XXXX-XXXX
+    if (!matchedByOneTimeCode && !looksLikeCode) {
+      const cleanLegacy = cleanRaw.replace(/^@/, "").toLowerCase();
+      const refAsNumber = parseInt(cleanLegacy, 10);
+      inviterRows = await db
+        .select({
+          id: users.id,
+          username: users.username,
+          displayName: users.displayName,
+          preferences: users.preferences,
+        })
+        .from(users)
+        .where(
+          !isNaN(refAsNumber) && String(refAsNumber) === cleanLegacy
+            ? or(eq(users.id, refAsNumber), ilike(users.username, cleanLegacy))
+            : ilike(users.username, cleanLegacy),
+        )
+        .limit(1);
+    }
+
+    if (inviterRows.length === 0) {
+      return {
+        applied: false,
+        reason: "not_found",
+        message: "ไม่พบโค้ดคำเชิญนี้ หรือโค้ดไม่ถูกต้อง",
+      };
+    }
+
     const inviter = inviterRows[0];
 
-    // ห้ามชวนตัวเอง
-    if (String(inviter.id) === String(newUser.id)) return false;
+    // ห้ามใช้โค้ดของตัวเอง
+    if (String(inviter.id) === String(newUser.id)) {
+      return {
+        applied: false,
+        reason: "self_invite",
+        message: "ไม่สามารถใช้โค้ดคำเชิญของตัวเองได้",
+      };
+    }
 
     const inviterPrefs =
       inviter.preferences && typeof inviter.preferences === "object"
@@ -55,8 +166,23 @@ async function applyMutualReferral(db, newUser, rawRef) {
         ? newUser.preferences
         : {};
 
-    // หากผู้ใช้นี้เคยรับสิทธิ์จากคนอื่นไปแล้ว ไม่ต้องซ้ำ
-    if (newUserPrefs.referredBy) return false;
+    // หากโค้ดแบบใช้ครั้งเดียวถูกใช้ไปแล้ว ห้ามใช้ซ้ำเด็ดขาด
+    if (inviterPrefs.inviteCodeUsed) {
+      return {
+        applied: false,
+        reason: "already_used",
+        message: "โค้ดคำเชิญนี้ถูกใช้งานไปแล้ว (ใช้ได้เพียง 1 ครั้งเท่านั้น)",
+      };
+    }
+
+    // หากผู้ใช้นี้เคยรับสิทธิ์จากโค้ดคำเชิญอื่นไปแล้ว ไม่สามารถรับซ้ำได้
+    if (newUserPrefs.referredBy) {
+      return {
+        applied: false,
+        reason: "already_claimed",
+        message: "บัญชีของคุณเคยรับสิทธิ์จากโค้ดคำเชิญไปแล้ว",
+      };
+    }
 
     const nowIso = new Date().toISOString();
 
@@ -67,6 +193,7 @@ async function applyMutualReferral(db, newUser, rawRef) {
       maxServicePosts: 2,
       referredBy: inviter.username,
       referredById: inviter.id,
+      referredCode: inviterPrefs.inviteCode || upperCode,
       referredAt: nowIso,
     };
 
@@ -78,11 +205,14 @@ async function applyMutualReferral(db, newUser, rawRef) {
       })
       .where(eq(users.id, newUser.id));
 
-    // 2. อัปเดตสิทธิ์ให้คนชวน (Inviter): เพิ่มเป็นสูงสุด 2 โพสต์
+    // 2. อัปเดตสิทธิ์ให้คนชวน (Inviter) และล็อกโค้ดเป็น "ใช้งานแล้ว" (One-Time Use)
     const updatedInviterPrefs = {
       ...inviterPrefs,
       serviceQuotaBonus: true,
       maxServicePosts: 2,
+      inviteCodeUsed: true,
+      inviteCodeUsedBy: newUser.username,
+      inviteCodeUsedAt: nowIso,
       referralCount: (Number(inviterPrefs.referralCount) || 0) + 1,
       lastReferredUsername: newUser.username,
       lastReferralAt: nowIso,
@@ -96,19 +226,27 @@ async function applyMutualReferral(db, newUser, rawRef) {
       })
       .where(eq(users.id, inviter.id));
 
-    // 3. แจ้งเตือนคนชวนว่าเพื่อนสมัครสำเร็จและปลดล็อกโควตา 2 โพสต์แล้ว
+    // 3. แจ้งเตือนคนชวนว่าเพื่อนใช้โค้ดสำเร็จและปลดล็อกโควตา 2 โพสต์แล้ว
     await createNotification(db, {
       userId: inviter.id,
       actorId: newUser.id,
       type: "follow",
       message:
-        "สมัครสมาชิกผ่านคำเชิญของคุณ! คุณและเพื่อนได้รับสิทธิ์โพสต์รับงานเพิ่มเป็นสูงสุด 2 โพสต์แล้ว 🎉",
+        "ใช้โค้ดคำเชิญของคุณสำเร็จ! คุณและเพื่อนได้รับสิทธิ์โพสต์รับงานเพิ่มเป็นสูงสุด 2 โพสต์แล้ว 🎉",
     });
 
-    return true;
+    return {
+      applied: true,
+      inviterUsername: inviter.username,
+      message: "ปลดล็อกสิทธิ์โพสต์รับงานเพิ่มเป็นสูงสุด 2 โพสต์เรียบร้อยแล้ว!",
+    };
   } catch (err) {
     console.warn("applyMutualReferral warning:", err.message);
-    return false;
+    return {
+      applied: false,
+      reason: "error",
+      message: "เกิดข้อผิดพลาดในการตรวจสอบโค้ดคำเชิญ",
+    };
   }
 }
 
@@ -240,11 +378,16 @@ auth.post("/sign-up", async (c) => {
 
     const user = inserted[0];
 
+    // สร้าง One-Time Invite Code ให้ผู้ใช้ใหม่ทันที
+    const initialPrefs = await ensureUserInviteCode(db, user);
+    user.preferences = initialPrefs;
+
     // หากสมัครผ่านลิงก์ชวนเพื่อน (ref / referredBy) ให้ปลดล็อกโควตา Service เป็น 2 โพสต์ทั้งสองฝ่าย
     const rawReferral = ref || referredBy || getCookie(c, "alinue_ref");
     let referralApplied = false;
     if (rawReferral) {
-      referralApplied = await applyMutualReferral(db, user, rawReferral);
+      const refResult = await applyMutualReferral(db, user, rawReferral);
+      referralApplied = Boolean(refResult?.applied);
       deleteCookie(c, "alinue_ref", { path: "/" });
     }
 
@@ -415,16 +558,22 @@ auth.get("/me", requireAuth, async (c) => {
     }
 
     const u = userList[0];
-    const quotaInfo = getUserServiceQuota(u.preferences);
+    const ensuredPrefs = await ensureUserInviteCode(db, u);
+    const quotaInfo = getUserServiceQuota(ensuredPrefs);
 
     return c.json({
       success: true,
       user: {
         ...u,
+        preferences: ensuredPrefs,
         serviceQuota: quotaInfo.maxServicePosts,
         isReferralUnlocked: quotaInfo.isReferralUnlocked,
         referralCount: quotaInfo.referralCount,
         referredBy: quotaInfo.referredBy,
+        inviteCode: quotaInfo.inviteCode,
+        inviteCodeUsed: quotaInfo.inviteCodeUsed,
+        inviteCodeUsedBy: quotaInfo.inviteCodeUsedBy,
+        inviteRemainingUses: quotaInfo.inviteRemainingUses,
       },
     });
   } catch (err) {
@@ -434,18 +583,126 @@ auth.get("/me", requireAuth, async (c) => {
 });
 
 /**
- * 3.1 POST /api/auth/claim-referral - รับสิทธิ์จากการชวนเพื่อน (สำหรับผู้ใช้ใหม่หรือหลัง Google Login)
+ * 3.05 GET /api/auth/invite-code - ดึง One-Time Invite Code ของผู้ใช้ปัจจุบัน
+ */
+auth.get("/invite-code", requireAuth, async (c) => {
+  try {
+    const authUser = c.get("user");
+    const db = getDrizzle(c);
+
+    const userRows = await db
+      .select({
+        id: users.id,
+        username: users.username,
+        preferences: users.preferences,
+      })
+      .from(users)
+      .where(eq(users.id, authUser.id))
+      .limit(1);
+
+    if (userRows.length === 0) {
+      return c.json({ success: false, message: "User not found" }, 404);
+    }
+
+    const ensuredPrefs = await ensureUserInviteCode(db, userRows[0]);
+    const quotaInfo = getUserServiceQuota(ensuredPrefs);
+
+    return c.json({
+      success: true,
+      inviteCode: quotaInfo.inviteCode,
+      isUsed: quotaInfo.inviteCodeUsed,
+      usedBy: quotaInfo.inviteCodeUsedBy,
+      remainingUses: quotaInfo.inviteRemainingUses,
+      isReferralUnlocked: quotaInfo.isReferralUnlocked,
+      maxServicePosts: quotaInfo.maxServicePosts,
+    });
+  } catch (err) {
+    console.error("Get /invite-code error:", err);
+    return c.json({ success: false, message: "Server error" }, 500);
+  }
+});
+
+/**
+ * 3.06 GET /api/auth/invite/:code - ตรวจสอบ One-Time Invite Code (Public สำหรับหน้า /join/[code])
+ */
+auth.get("/invite/:code", async (c) => {
+  try {
+    const rawCode = c.req.param("code");
+    const normalizedCode = normalizeInviteCode(rawCode);
+    if (!normalizedCode) {
+      return c.json({
+        success: true,
+        valid: false,
+        reason: "invalid_code",
+        message: "รูปแบบโค้ดคำเชิญไม่ถูกต้อง",
+      });
+    }
+
+    const db = getDrizzle(c);
+    const rows = await db
+      .select({
+        id: users.id,
+        username: users.username,
+        displayName: users.displayName,
+        avatarUrl: users.avatarUrl,
+        preferences: users.preferences,
+      })
+      .from(users)
+      .where(sql`UPPER(${users.preferences}->>'inviteCode') = ${normalizedCode}`)
+      .limit(1);
+
+    if (rows.length === 0) {
+      return c.json({
+        success: true,
+        valid: false,
+        isUsed: false,
+        code: normalizedCode,
+        reason: "not_found",
+        message: "ไม่พบโค้ดคำเชิญนี้ หรือโค้ดไม่ถูกต้อง",
+      });
+    }
+
+    const inviter = rows[0];
+    const inviterPrefs =
+      inviter.preferences && typeof inviter.preferences === "object"
+        ? inviter.preferences
+        : {};
+    const isUsed = Boolean(inviterPrefs.inviteCodeUsed);
+
+    return c.json({
+      success: true,
+      valid: !isUsed,
+      isUsed,
+      code: inviterPrefs.inviteCode || normalizedCode,
+      reason: isUsed ? "already_used" : null,
+      message: isUsed
+        ? "โค้ดคำเชิญนี้ถูกใช้งานไปแล้ว (ใช้ได้เพียง 1 ครั้ง)"
+        : "โค้ดคำเชิญนี้สามารถใช้งานได้",
+      inviter: {
+        username: inviter.username,
+        displayName: inviter.displayName || inviter.username,
+        avatarUrl: inviter.avatarUrl || null,
+      },
+    });
+  } catch (err) {
+    console.error("Inspect /invite/:code error:", err);
+    return c.json({ success: false, message: "Server error" }, 500);
+  }
+});
+
+/**
+ * 3.1 POST /api/auth/claim-referral - รับสิทธิ์จากการใส่ One-Time Invite Code
  */
 auth.post("/claim-referral", requireAuth, async (c) => {
   try {
     const authUser = c.get("user");
     const db = getDrizzle(c);
     const body = await c.req.json().catch(() => ({}));
-    const rawRef = body.ref || body.referredBy;
+    const rawRef = body.code || body.ref || body.referredBy;
 
     if (!rawRef) {
       return c.json(
-        { success: false, message: "กรุณาระบุรหัสผู้แนะนำ (ref)" },
+        { success: false, message: "กรุณาระบุโค้ดคำเชิญ" },
         400,
       );
     }
@@ -465,17 +722,17 @@ auth.post("/claim-referral", requireAuth, async (c) => {
     }
 
     const currentUser = userRows[0];
-    const applied = await applyMutualReferral(db, currentUser, rawRef);
+    const result = await applyMutualReferral(db, currentUser, rawRef);
 
     return c.json({
       success: true,
-      applied,
-      serviceQuota: applied
+      applied: result.applied,
+      reason: result.reason || null,
+      inviterUsername: result.inviterUsername || null,
+      serviceQuota: result.applied
         ? 2
         : getUserServiceQuota(currentUser.preferences).maxServicePosts,
-      message: applied
-        ? "ปลดล็อกสิทธิ์โพสต์รับงานสูงสุด 2 โพสต์เรียบร้อยแล้ว!"
-        : "ไม่สามารถใช้รหัสแนะนำนี้ได้ หรือคุณได้รับสิทธิ์ไปแล้ว",
+      message: result.message,
     });
   } catch (err) {
     console.error("Claim referral error:", err);
