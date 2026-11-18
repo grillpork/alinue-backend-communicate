@@ -53,6 +53,106 @@ userRouter.get('/suggested', optionalAuth, async (c) => {
 });
 
 /**
+ * 1.5 GET /api/users/notes - ดึงโน้ตของตัวเองและเพื่อน (คนที่ติดตามหรือติดตามเรา)
+ */
+userRouter.get('/notes', optionalAuth, async (c) => {
+  try {
+    const db = getDrizzle(c);
+    const currentUser = c.get('user');
+
+    let myNote = null;
+    if (currentUser?.id) {
+      const meRows = await db
+        .select({
+          id: users.id,
+          username: users.username,
+          displayName: users.displayName,
+          avatarUrl: users.avatarUrl,
+          note: users.note,
+          noteUpdatedAt: users.noteUpdatedAt,
+        })
+        .from(users)
+        .where(eq(users.id, currentUser.id))
+        .limit(1);
+
+      if (meRows.length > 0) {
+        const me = meRows[0];
+        myNote = {
+          id: me.id,
+          username: me.username,
+          name: me.displayName || me.username,
+          avatar: me.avatarUrl || null,
+          note: (me.note || '').trim(),
+          noteUpdatedAt: me.noteUpdatedAt || null,
+        };
+      }
+    }
+
+    const noteCondition = sql`LENGTH(TRIM(COALESCE(${users.note}, ''))) > 0`;
+
+    let friendRows = [];
+    if (currentUser?.id) {
+      friendRows = await db
+        .select({
+          id: users.id,
+          username: users.username,
+          displayName: users.displayName,
+          avatarUrl: users.avatarUrl,
+          note: users.note,
+          noteUpdatedAt: users.noteUpdatedAt,
+          updatedAt: users.updatedAt,
+        })
+        .from(users)
+        .where(
+          and(
+            ne(users.id, currentUser.id),
+            noteCondition,
+            sql`(
+              EXISTS(SELECT 1 FROM follows f WHERE f.follower_id = ${currentUser.id} AND f.following_id = ${users.id})
+              OR EXISTS(SELECT 1 FROM follows f WHERE f.following_id = ${currentUser.id} AND f.follower_id = ${users.id})
+            )`
+          )
+        )
+        .orderBy(sql`COALESCE(${users.noteUpdatedAt}, ${users.updatedAt}) DESC`)
+        .limit(20);
+    } else {
+      friendRows = await db
+        .select({
+          id: users.id,
+          username: users.username,
+          displayName: users.displayName,
+          avatarUrl: users.avatarUrl,
+          note: users.note,
+          noteUpdatedAt: users.noteUpdatedAt,
+          updatedAt: users.updatedAt,
+        })
+        .from(users)
+        .where(noteCondition)
+        .orderBy(sql`COALESCE(${users.noteUpdatedAt}, ${users.updatedAt}) DESC`)
+        .limit(15);
+    }
+
+    const notes = friendRows.map((u) => ({
+      id: u.id,
+      username: u.username,
+      name: u.displayName || u.username,
+      avatar: u.avatarUrl || null,
+      note: (u.note || '').trim(),
+      noteUpdatedAt: u.noteUpdatedAt || u.updatedAt || null,
+    }));
+
+    return c.json({
+      success: true,
+      myNote,
+      notes,
+    });
+  } catch (err) {
+    console.error('Get notes error:', err);
+    return c.json({ success: false, message: 'Server error' }, 500);
+  }
+});
+
+/**
  * 2. GET /api/users/search - ค้นหาครีเอเตอร์ / ดีไซเนอร์ตามชื่อหรือ Username
  */
 userRouter.get('/search', optionalAuth, async (c) => {
@@ -350,7 +450,10 @@ userRouter.patch('/profile', requireAuth, async (c) => {
     if (banner !== undefined) updateData.banner = banner;
     if (location !== undefined) updateData.location = location;
     if (website !== undefined) updateData.website = website;
-    if (note !== undefined) updateData.note = note;
+    if (note !== undefined) {
+      updateData.note = note;
+      updateData.noteUpdatedAt = note && String(note).trim() ? sql`NOW()` : null;
+    }
     if (socialLinks !== undefined) updateData.socialLinks = socialLinks;
 
     const updated = await db
@@ -367,6 +470,7 @@ userRouter.patch('/profile', requireAuth, async (c) => {
         banner: users.banner,
         website: users.website,
         note: users.note,
+        noteUpdatedAt: users.noteUpdatedAt,
         socialLinks: users.socialLinks,
         updatedAt: users.updatedAt,
       });
